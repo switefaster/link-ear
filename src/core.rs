@@ -338,3 +338,97 @@ pub fn format_duration_ms(duration_ms: u64) -> String {
 
 const TIMESTAMP_SECONDS_CUTOFF: i64 = 10_000_000_000;
 const TIMESTAMP_MILLIS_CUTOFF: i64 = 10_000_000_000_000;
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use tokio::time::{Duration, Instant};
+
+    use super::*;
+
+    fn playback_state() -> PlaybackState {
+        PlaybackState {
+            session_id: "session".to_string(),
+            leader_peer_id: "leader".to_string(),
+            track: None,
+            track_requested_by: None,
+            state_version: 1,
+            issued_at_micros: 1_700_000_000_000_000,
+            playing: false,
+            position_ms: 0,
+            anchor_time_micros: 1_700_000_000_000_000,
+            rate: 1.0,
+        }
+    }
+
+    #[test]
+    fn normalize_timestamp_micros_handles_seconds_millis_and_micros() {
+        assert_eq!(
+            normalize_timestamp_micros(1_700_000_000),
+            1_700_000_000_000_000
+        );
+        assert_eq!(
+            normalize_timestamp_micros(1_700_000_000_123),
+            1_700_000_000_123_000
+        );
+        assert_eq!(
+            normalize_timestamp_micros(1_700_000_000_123_456),
+            1_700_000_000_123_456
+        );
+    }
+
+    #[test]
+    fn format_duration_ms_uses_total_minutes() {
+        assert_eq!(format_duration_ms(65_000), "01:05");
+        assert_eq!(format_duration_ms(3_665_000), "61:05");
+    }
+
+    #[test]
+    fn pending_playback_tracks_expected_ready_subset() {
+        let expected = HashSet::from(["alice".to_string(), "bob".to_string()]);
+        let mut pending = PendingPlayback::new(
+            playback_state(),
+            expected,
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        assert_eq!(pending.expected_count(), 2);
+        assert_eq!(pending.ready_count(), 0);
+        assert!(!pending.is_ready());
+        assert!(!pending.mark_ready("carol".to_string()));
+
+        assert!(pending.mark_ready("alice".to_string()));
+        assert_eq!(pending.ready_count(), 1);
+        assert!(!pending.is_ready());
+
+        assert!(pending.mark_ready("bob".to_string()));
+        assert_eq!(pending.ready_count(), 2);
+        assert!(pending.is_ready());
+    }
+
+    #[test]
+    fn active_vote_replaces_peer_ballot() {
+        let proposal = VoteProposal {
+            vote_id: "vote-1".to_string(),
+            proposer: "alice".to_string(),
+            action: VoteAction::Pause,
+            queue_version: 1,
+            playback_session_id: Some("session".to_string()),
+            created_at_micros: 1_700_000_000_000_000,
+        };
+        let mut vote = ActiveVote::new(proposal, Instant::now() + Duration::from_secs(1));
+
+        vote.vote("bob".to_string(), true);
+        assert_eq!(vote.approval_count(), 1);
+        assert_eq!(vote.rejections.len(), 0);
+
+        vote.vote("bob".to_string(), false);
+        assert_eq!(vote.approval_count(), 0);
+        assert_eq!(vote.rejections.len(), 1);
+
+        vote.vote("bob".to_string(), true);
+        assert_eq!(vote.approval_count(), 1);
+        assert_eq!(vote.rejections.len(), 0);
+    }
+}

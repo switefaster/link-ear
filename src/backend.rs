@@ -16,7 +16,7 @@ use libp2p::{
     Multiaddr, PeerId, StreamProtocol, SwarmBuilder, dcutr, gossipsub, identify, mdns, noise, ping,
     relay, rendezvous, request_response,
     swarm::{
-        ConnectionId, NetworkBehaviour, SwarmEvent,
+        NetworkBehaviour, SwarmEvent,
         behaviour::toggle::Toggle,
         dial_opts::{DialOpts, PeerCondition},
     },
@@ -30,11 +30,21 @@ use tokio::{
 
 use crate::{
     bilibili,
+    connection_state::{
+        ConnectionEffect, ConnectionState, DIRECT_PROMOTION_RETRY_INTERVAL,
+        GOSSIP_WARMUP_CHECK_INTERVAL, PeerConnectionRoutes, RelayCloseReason, is_relay_address,
+        normalize_peer_address, peer_id_from_multiaddr, prioritize_multiaddrs,
+    },
     core::{
-        ActiveVote, ChatRecord, FrontendEvent as UiEvent, MAX_MESSAGES, NetworkCommand,
-        PeerNameClaim, PendingPlayback, PlaybackState, PlaybackView, QueueItem, QueueState,
-        VoteAction, VoteProposal, VoteView, WireMessage, format_duration_ms,
+        ChatRecord, FrontendEvent as UiEvent, MAX_MESSAGES, NetworkCommand, PeerNameClaim,
+        PlaybackState, PlaybackView, QueueItem, QueueState, VoteAction, VoteProposal, WireMessage,
         normalize_timestamp_micros,
+    },
+    music_state::{
+        MusicState, PlaybackReadyOutcome, can_control_playback, can_play_at_position,
+        describe_vote_action, is_queue_state_newer, majority_threshold,
+        normalize_remote_playback_state, playback_position_ms, playback_should_be_audible,
+        queue_item_at, should_apply_playback_state,
     },
     player,
 };
@@ -49,15 +59,6 @@ const MUSIC_DRIFT_SEEK_THRESHOLD_MS: u64 = 700;
 const MUSIC_PREPARE_TIMEOUT: Duration = Duration::from_secs(12);
 const MUSIC_START_DELAY: Duration = Duration::from_millis(1500);
 const VOTE_TIMEOUT: Duration = Duration::from_secs(20);
-const DIRECT_PROMOTION_RETRY_INTERVAL: Duration = Duration::from_secs(30);
-const DIRECT_PROMOTION_MEDIUM_RETRY_INTERVAL: Duration = Duration::from_secs(120);
-const DIRECT_PROMOTION_SLOW_RETRY_INTERVAL: Duration = Duration::from_secs(600);
-const DIRECT_PROMOTION_MEDIUM_RETRY_FAILURES: u32 = 3;
-const DIRECT_PROMOTION_SLOW_RETRY_FAILURES: u32 = 6;
-const DIRECT_PROMOTION_MAX_FAILURES: u32 = 10;
-const DIRECT_PROMOTION_FAILURE_DEDUP_WINDOW: Duration = Duration::from_secs(5);
-const GOSSIP_WARMUP_TIMEOUT: Duration = Duration::from_secs(5);
-const GOSSIP_WARMUP_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const RENDEZVOUS_DISCOVER_INTERVAL: Duration = Duration::from_secs(30);
 const RENDEZVOUS_REGISTER_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const RENDEZVOUS_TTL_SECONDS: u64 = 60 * 60 * 2;
@@ -96,131 +97,6 @@ struct DirectMessageResponse {
     accepted: bool,
 }
 
-#[derive(Default)]
-struct PeerConnectionRoutes {
-    direct: HashSet<ConnectionId>,
-    relayed: HashSet<ConnectionId>,
-}
-
-impl PeerConnectionRoutes {
-    fn add(&mut self, connection_id: ConnectionId, is_relayed: bool) {
-        if is_relayed {
-            self.relayed.insert(connection_id);
-        } else {
-            self.direct.insert(connection_id);
-        }
-    }
-
-    fn remove(&mut self, connection_id: ConnectionId, was_relayed: bool) {
-        if was_relayed {
-            self.relayed.remove(&connection_id);
-        } else {
-            self.direct.remove(&connection_id);
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.direct.is_empty() && self.relayed.is_empty()
-    }
-
-    fn is_relay_only(&self) -> bool {
-        self.direct.is_empty() && !self.relayed.is_empty()
-    }
-
-    fn has_direct(&self) -> bool {
-        !self.direct.is_empty()
-    }
-
-    fn has_relayed(&self) -> bool {
-        !self.relayed.is_empty()
-    }
-
-    fn relayed_connections(&self) -> Vec<ConnectionId> {
-        self.relayed.iter().copied().collect()
-    }
-}
-
-#[derive(Default)]
-struct DirectPromotionBackoff {
-    failures: u32,
-    last_attempt: Option<Instant>,
-    last_failure: Option<Instant>,
-    in_flight: bool,
-    suspended_reported: bool,
-}
-
-impl DirectPromotionBackoff {
-    fn retry_interval(&self) -> Duration {
-        match self.failures {
-            0..DIRECT_PROMOTION_MEDIUM_RETRY_FAILURES => DIRECT_PROMOTION_RETRY_INTERVAL,
-            DIRECT_PROMOTION_MEDIUM_RETRY_FAILURES..DIRECT_PROMOTION_SLOW_RETRY_FAILURES => {
-                DIRECT_PROMOTION_MEDIUM_RETRY_INTERVAL
-            }
-            _ => DIRECT_PROMOTION_SLOW_RETRY_INTERVAL,
-        }
-    }
-
-    fn retry_remaining(&self) -> Option<Duration> {
-        let last_attempt = self.last_attempt?;
-        self.retry_interval().checked_sub(last_attempt.elapsed())
-    }
-
-    fn should_attempt(&self) -> bool {
-        !self.in_flight
-            && self.failures < DIRECT_PROMOTION_MAX_FAILURES
-            && self.retry_remaining().is_none()
-    }
-
-    fn mark_attempt(&mut self) {
-        self.last_attempt = Some(Instant::now());
-        self.in_flight = true;
-    }
-
-    fn mark_failure(&mut self) -> DirectPromotionFailureOutcome {
-        let now = Instant::now();
-        self.in_flight = false;
-        if self.last_failure.is_some_and(|last_failure| {
-            now.duration_since(last_failure) < DIRECT_PROMOTION_FAILURE_DEDUP_WINDOW
-        }) {
-            return DirectPromotionFailureOutcome::Duplicate;
-        }
-
-        self.last_failure = Some(now);
-        self.failures = self.failures.saturating_add(1);
-        self.suspended_reported = false;
-
-        DirectPromotionFailureOutcome::Counted {
-            failures: self.failures,
-            retry_after: (self.failures < DIRECT_PROMOTION_MAX_FAILURES)
-                .then(|| self.retry_interval()),
-        }
-    }
-}
-
-enum DirectPromotionFailureOutcome {
-    Counted {
-        failures: u32,
-        retry_after: Option<Duration>,
-    },
-    Duplicate,
-}
-
-struct GossipsubWarmup {
-    started_at: Instant,
-}
-
-impl GossipsubWarmup {
-    fn new() -> Self {
-        Self {
-            started_at: Instant::now(),
-        }
-    }
-
-    fn is_expired(&self) -> bool {
-        self.started_at.elapsed() >= GOSSIP_WARMUP_TIMEOUT
-    }
-}
-
 enum ChatPublishOutcome {
     Published,
     NoPeersSubscribed,
@@ -232,7 +108,6 @@ pub async fn run_network(
     ui: mpsc::Sender<UiEvent>,
 ) -> Result<()> {
     let topic = gossipsub::IdentTopic::new(config.topic.clone());
-    let mut explicit_peers = HashSet::new();
     let mut seen_messages = HashSet::new();
     let mut history = Vec::new();
     let mut message_seq = 0_u64;
@@ -241,19 +116,11 @@ pub async fn run_network(
     let mut history_request_times = HashMap::new();
     let mut queue_request_times = HashMap::new();
     let mut pending_sync_summaries = VecDeque::new();
-    let mut peer_routes: HashMap<PeerId, PeerConnectionRoutes> = HashMap::new();
-    let mut chat_subscribers = HashSet::new();
-    let mut peer_direct_addresses: HashMap<PeerId, HashSet<Multiaddr>> = HashMap::new();
-    let mut direct_promotion_backoffs = HashMap::new();
-    let mut gossip_warmups = HashMap::new();
     let mut rendezvous_nodes = HashSet::new();
     let mut rendezvous_cookies = HashMap::new();
     let rendezvous_namespace = rendezvous::Namespace::new(config.topic.clone())
         .map_err(|err| anyhow!("invalid rendezvous namespace '{}': {err}", config.topic))?;
-    let mut music_queue = VecDeque::new();
-    let mut queue_version = 0_u64;
-    let mut queue_updated_at = 0_i64;
-    let mut active_vote: Option<ActiveVote> = None;
+    let mut music = MusicState::new();
     let http_client = bilibili::client()?;
     let mut audio_player = match player::AudioPlayer::new() {
         Ok(player) => Some(player),
@@ -262,9 +129,6 @@ pub async fn run_network(
             None
         }
     };
-    let mut playback_state: Option<PlaybackState> = None;
-    let mut pending_playback: Option<PendingPlayback> = None;
-    let mut playback_version = 0_u64;
     let mut history_sync = time::interval(HISTORY_SYNC_INTERVAL);
     history_sync.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut history_sync_burst = time::interval(HISTORY_SYNC_BURST_TICK);
@@ -331,18 +195,12 @@ pub async fn run_network(
         .build();
 
     let local_peer_id = *swarm.local_peer_id();
+    let mut connections = ConnectionState::new(local_peer_id);
     let local_joined_at = current_timestamp_micros();
     let _ = ui
         .send(UiEvent::LocalPeerId(local_peer_id.to_string()))
         .await;
-    send_queue_view(
-        &ui,
-        queue_version,
-        queue_updated_at,
-        local_peer_id,
-        &music_queue,
-    )
-    .await;
+    send_queue_view(&ui, local_peer_id, &music).await;
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     let listen_addrs = if config.listen.is_empty() {
@@ -444,7 +302,7 @@ pub async fn run_network(
                         Ok(ChatPublishOutcome::NoPeersSubscribed) => {
                             let direct_count = send_direct_message_to_connected_peers(
                                 &mut swarm,
-                                &peer_routes,
+                                connections.routes(),
                                 &rendezvous_nodes,
                                 &config.topic,
                                 &msg,
@@ -480,35 +338,18 @@ pub async fn run_network(
                                 requested_by: local_peer_id.to_string(),
                                 added_at_micros: current_timestamp_micros(),
                             };
-                            let index = position
-                                .map(|position| position.saturating_sub(1).min(music_queue.len()))
-                                .unwrap_or(music_queue.len());
                             let title = item.track.title.clone();
-                            music_queue.insert(index, item);
+                            let index = music.insert_queue_item(item, position);
                             publish_queue_state(
                                 &mut swarm,
                                 &topic,
-                                &mut queue_version,
-                                &mut queue_updated_at,
+                                &mut music,
                                 local_peer_id,
-                                &music_queue,
                             )?;
-                            send_queue_view(
-                                &ui,
-                                queue_version,
-                                queue_updated_at,
-                                local_peer_id,
-                                &music_queue,
-                            )
-                            .await;
+                            send_queue_view(&ui, local_peer_id, &music).await;
                             send_status(&ui, format!("queued #{}, {title}", index + 1)).await;
                             start_next_if_idle(
-                                &mut music_queue,
-                                &mut queue_version,
-                                &mut queue_updated_at,
-                                &mut pending_playback,
-                                &mut playback_state,
-                                &mut playback_version,
+                                &mut music,
                                 &mut audio_player,
                                 &http_client,
                                 &mut swarm,
@@ -524,43 +365,28 @@ pub async fn run_network(
                     }
                 }
                 Some(NetworkCommand::ShowQueue) => {
-                    send_queue_view(
-                        &ui,
-                        queue_version,
-                        queue_updated_at,
-                        local_peer_id,
-                        &music_queue,
-                    )
-                    .await;
-                    send_queue_status(&ui, playback_state.as_ref(), &music_queue).await;
+                    send_queue_view(&ui, local_peer_id, &music).await;
+                    send_queue_status(&ui, music.playback_state(), &music.queue).await;
                 }
                 Some(NetworkCommand::Pause) => {
-                    if let Some(state) = playback_state.as_mut() {
+                    if music.playback_state().is_some() {
                         let now = current_timestamp_micros();
-                        if can_control_playback(state, local_peer_id) {
-                            let position_ms = playback_position_ms(state, now);
-                            playback_version += 1;
-                            state.state_version = playback_version;
-                            state.issued_at_micros = now;
-                            state.playing = false;
-                            state.position_ms = position_ms;
-                            state.anchor_time_micros = now;
-                            state.leader_peer_id = local_peer_id.to_string();
+                        if music
+                            .playback_state()
+                            .is_some_and(|state| can_control_playback(state, local_peer_id))
+                        {
+                            let Some(state) = music.pause_playback(local_peer_id, now) else {
+                                continue;
+                            };
                             if let Some(player) = &mut audio_player {
                                 player.set_playing(false, now)?;
                             }
-                            send_playback_view(&ui, state).await;
-                            publish_playback_state(&mut swarm, &topic, state)?;
+                            send_playback_view(&ui, &state).await;
+                            publish_playback_state(&mut swarm, &topic, &state)?;
                         } else {
                             propose_or_execute_vote(
                                 VoteAction::Pause,
-                                &mut active_vote,
-                                &mut music_queue,
-                                &mut queue_version,
-                                &mut queue_updated_at,
-                                &mut pending_playback,
-                                &mut playback_state,
-                                &mut playback_version,
+                                &mut music,
                                 &mut audio_player,
                                 &http_client,
                                 &mut swarm,
@@ -573,33 +399,24 @@ pub async fn run_network(
                     }
                 }
                 Some(NetworkCommand::Resume) => {
-                    if let Some(state) = playback_state.as_mut() {
+                    if music.playback_state().is_some() {
                         let now = current_timestamp_micros();
-                        if can_control_playback(state, local_peer_id) {
-                            let position_ms = playback_position_ms(state, now);
-                            let playing = can_play_at_position(state, position_ms);
-                            playback_version += 1;
-                            state.state_version = playback_version;
-                            state.issued_at_micros = now;
-                            state.playing = playing;
-                            state.position_ms = position_ms;
-                            state.anchor_time_micros = now;
-                            state.leader_peer_id = local_peer_id.to_string();
+                        if music
+                            .playback_state()
+                            .is_some_and(|state| can_control_playback(state, local_peer_id))
+                        {
+                            let Some(state) = music.resume_playback(local_peer_id, now) else {
+                                continue;
+                            };
                             if let Some(player) = &mut audio_player {
-                                player.set_playing(playing, now)?;
+                                player.set_playing(state.playing, now)?;
                             }
-                            send_playback_view(&ui, state).await;
-                            publish_playback_state(&mut swarm, &topic, state)?;
+                            send_playback_view(&ui, &state).await;
+                            publish_playback_state(&mut swarm, &topic, &state)?;
                         } else {
                             propose_or_execute_vote(
                                 VoteAction::Resume,
-                                &mut active_vote,
-                                &mut music_queue,
-                                &mut queue_version,
-                                &mut queue_updated_at,
-                                &mut pending_playback,
-                                &mut playback_state,
-                                &mut playback_version,
+                                &mut music,
                                 &mut audio_player,
                                 &http_client,
                                 &mut swarm,
@@ -612,35 +429,28 @@ pub async fn run_network(
                     }
                 }
                 Some(NetworkCommand::Seek(position_ms)) => {
-                    if let Some(state) = playback_state.as_mut() {
+                    if music.playback_state().is_some() {
                         let now = current_timestamp_micros();
-                        if can_control_playback(state, local_peer_id) {
-                            let position_ms = clamp_playback_position_ms(state, position_ms);
-                            let playing = state.playing && can_play_at_position(state, position_ms);
-                            playback_version += 1;
-                            state.state_version = playback_version;
-                            state.issued_at_micros = now;
-                            state.playing = playing;
-                            state.position_ms = position_ms;
-                            state.anchor_time_micros = now;
-                            state.leader_peer_id = local_peer_id.to_string();
+                        if music
+                            .playback_state()
+                            .is_some_and(|state| can_control_playback(state, local_peer_id))
+                        {
+                            let Some(state) =
+                                music.seek_playback(local_peer_id, position_ms, now)
+                            else {
+                                continue;
+                            };
                             if let Some(player) = &mut audio_player {
-                                if let Err(err) = player.seek(position_ms, playing, now) {
+                                if let Err(err) = player.seek(state.position_ms, state.playing, now) {
                                     send_status(&ui, format!("audio seek failed: {err:#}")).await;
                                 }
                             }
-                            send_playback_view(&ui, state).await;
-                            publish_playback_state(&mut swarm, &topic, state)?;
+                            send_playback_view(&ui, &state).await;
+                            publish_playback_state(&mut swarm, &topic, &state)?;
                         } else {
                             propose_or_execute_vote(
                                 VoteAction::Seek { position_ms },
-                                &mut active_vote,
-                                &mut music_queue,
-                                &mut queue_version,
-                                &mut queue_updated_at,
-                                &mut pending_playback,
-                                &mut playback_state,
-                                &mut playback_version,
+                                &mut music,
                                 &mut audio_player,
                                 &http_client,
                                 &mut swarm,
@@ -653,17 +463,12 @@ pub async fn run_network(
                     }
                 }
                 Some(NetworkCommand::Skip) => {
-                    if playback_state
-                        .as_ref()
+                    if music
+                        .playback_state()
                         .is_some_and(|state| can_control_playback(state, local_peer_id))
                     {
                         skip_current_track(
-                            &mut music_queue,
-                            &mut queue_version,
-                            &mut queue_updated_at,
-                            &mut pending_playback,
-                            &mut playback_state,
-                            &mut playback_version,
+                            &mut music,
                             &mut audio_player,
                             &http_client,
                             &mut swarm,
@@ -675,13 +480,7 @@ pub async fn run_network(
                     } else {
                         propose_or_execute_vote(
                             VoteAction::Skip,
-                            &mut active_vote,
-                            &mut music_queue,
-                            &mut queue_version,
-                            &mut queue_updated_at,
-                            &mut pending_playback,
-                            &mut playback_state,
-                            &mut playback_version,
+                            &mut music,
                             &mut audio_player,
                             &http_client,
                             &mut swarm,
@@ -693,27 +492,18 @@ pub async fn run_network(
                     }
                 }
                 Some(NetworkCommand::RemoveQueueItem(index)) => {
-                    match queue_item_at(&music_queue, index) {
+                    match queue_item_at(&music.queue, index) {
                         Some(item) if item.requested_by == local_peer_id.to_string() =>
                         {
                             let title = item.track.title.clone();
-                            music_queue.remove(index - 1);
+                            music.remove_queue_index(index);
                             publish_queue_state(
                                 &mut swarm,
                                 &topic,
-                                &mut queue_version,
-                                &mut queue_updated_at,
+                                &mut music,
                                 local_peer_id,
-                                &music_queue,
                             )?;
-                            send_queue_view(
-                                &ui,
-                                queue_version,
-                                queue_updated_at,
-                                local_peer_id,
-                                &music_queue,
-                            )
-                            .await;
+                            send_queue_view(&ui, local_peer_id, &music).await;
                             send_status(&ui, format!("removed #{index}: {title}")).await;
                         }
                         Some(item) => {
@@ -721,13 +511,7 @@ pub async fn run_network(
                                 VoteAction::Remove {
                                     item_id: item.item_id.clone(),
                                 },
-                                &mut active_vote,
-                                &mut music_queue,
-                                &mut queue_version,
-                                &mut queue_updated_at,
-                                &mut pending_playback,
-                                &mut playback_state,
-                                &mut playback_version,
+                                &mut music,
                                 &mut audio_player,
                                 &http_client,
                                 &mut swarm,
@@ -741,20 +525,14 @@ pub async fn run_network(
                     }
                 }
                 Some(NetworkCommand::MoveQueueItem { from, to }) => {
-                    match queue_item_at(&music_queue, from) {
+                    match queue_item_at(&music.queue, from) {
                         Some(item) => {
                             propose_or_execute_vote(
                                 VoteAction::Move {
                                     item_id: item.item_id.clone(),
                                     to_index: to.saturating_sub(1),
                                 },
-                                &mut active_vote,
-                                &mut music_queue,
-                                &mut queue_version,
-                                &mut queue_updated_at,
-                                &mut pending_playback,
-                                &mut playback_state,
-                                &mut playback_version,
+                                &mut music,
                                 &mut audio_player,
                                 &http_client,
                                 &mut swarm,
@@ -770,13 +548,7 @@ pub async fn run_network(
                 Some(NetworkCommand::Vote(approve)) => {
                     cast_vote(
                         approve,
-                        &mut active_vote,
-                        &mut music_queue,
-                        &mut queue_version,
-                        &mut queue_updated_at,
-                        &mut pending_playback,
-                        &mut playback_state,
-                        &mut playback_version,
+                        &mut music,
                         &mut audio_player,
                         &http_client,
                         &mut swarm,
@@ -789,27 +561,18 @@ pub async fn run_network(
                 None => break,
             },
             _ = music_local.tick() => {
-                if active_vote.as_ref().is_some_and(|vote| Instant::now() >= vote.deadline) {
-                    if let Some(vote) = active_vote.take() {
-                        send_status(&ui, format!("vote {} timed out", vote.proposal.vote_id)).await;
-                        send_vote_view(
-                            &ui,
-                            None,
-                            &music_queue,
-                            majority_threshold(swarm.connected_peers().count() + 1),
-                        )
-                        .await;
-                    }
+                if let Some(vote) = music.take_timed_out_vote(Instant::now()) {
+                    send_status(&ui, format!("vote {} timed out", vote.proposal.vote_id)).await;
+                    send_vote_view(
+                        &ui,
+                        &music,
+                        majority_threshold(swarm.connected_peers().count() + 1),
+                    )
+                    .await;
                 }
 
                 if let Err(err) = resolve_active_vote(
-                    &mut active_vote,
-                    &mut music_queue,
-                    &mut queue_version,
-                    &mut queue_updated_at,
-                    &mut pending_playback,
-                    &mut playback_state,
-                    &mut playback_version,
+                    &mut music,
                     &mut audio_player,
                     &http_client,
                     &mut swarm,
@@ -823,11 +586,10 @@ pub async fn run_network(
                 }
 
                 if let Err(err) = maybe_start_pending_playback(
-                    &mut pending_playback,
-                    &mut playback_state,
-                    &mut playback_version,
+                    &mut music,
                     &mut swarm,
                     &topic,
+                    local_peer_id,
                     &ui,
                 )
                 .await
@@ -836,7 +598,7 @@ pub async fn run_network(
                 }
 
                 let mut finished_current = false;
-                if let Some(state) = playback_state.as_mut() {
+                if let Some(state) = music.playback_state() {
                     let now = current_timestamp_micros();
                     if let Err(err) = sync_loaded_player_to_state(&mut audio_player, state, now) {
                         send_status(&ui, format!("playback sync failed: {err:#}")).await;
@@ -858,9 +620,7 @@ pub async fn run_network(
 
                 if finished_current {
                     stop_current_playback(
-                        &mut pending_playback,
-                        &mut playback_state,
-                        &mut playback_version,
+                        &mut music,
                         &mut audio_player,
                         &mut swarm,
                         &topic,
@@ -870,12 +630,7 @@ pub async fn run_network(
                     )
                     .await?;
                     start_next_if_idle(
-                        &mut music_queue,
-                        &mut queue_version,
-                        &mut queue_updated_at,
-                        &mut pending_playback,
-                        &mut playback_state,
-                        &mut playback_version,
+                        &mut music,
                         &mut audio_player,
                         &http_client,
                         &mut swarm,
@@ -894,9 +649,9 @@ pub async fn run_network(
                     &config.name,
                     local_joined_at,
                     &history,
-                    queue_version,
-                    queue_updated_at,
-                    &music_queue,
+                    music.queue_version,
+                    music.queue_updated_at,
+                    &music.queue,
                 ) {
                     send_status(&ui, format!("sync summary failed: {err}")).await;
                 }
@@ -910,16 +665,17 @@ pub async fn run_network(
                     &config.name,
                     local_joined_at,
                     &history,
-                    queue_version,
-                    queue_updated_at,
-                    &music_queue,
+                    music.queue_version,
+                    music.queue_updated_at,
+                    &music.queue,
                 ) {
                     send_status(&ui, format!("sync summary failed: {err}")).await;
                 }
             },
             _ = music_sync.tick() => {
-                if pending_playback.is_none() {
-                    if let Some(state) = playback_state.as_mut() {
+                if !music.has_pending_playback() {
+                    let mut state_to_publish = None;
+                    if let Some(state) = music.playback_state_mut() {
                         if state.leader_peer_id == local_peer_id.to_string() && state.track.is_some() {
                             let now = current_timestamp_micros();
                             if !state.playing || now >= state.anchor_time_micros {
@@ -927,20 +683,19 @@ pub async fn run_network(
                                 state.anchor_time_micros = now;
                             }
                             state.issued_at_micros = now;
-                            publish_playback_state(&mut swarm, &topic, state)?;
-                            send_playback_view(&ui, state).await;
+                            state_to_publish = Some(state.clone());
                         }
+                    }
+                    if let Some(state) = state_to_publish {
+                        publish_playback_state(&mut swarm, &topic, &state)?;
+                        send_playback_view(&ui, &state).await;
                     }
                 }
             },
             _ = direct_promotion.tick() => {
                 retry_direct_promotions(
                     &mut swarm,
-                    &peer_routes,
-                    &peer_direct_addresses,
-                    &mut direct_promotion_backoffs,
-                    &chat_subscribers,
-                    &mut gossip_warmups,
+                    &mut connections,
                     &ui,
                 )
                 .await;
@@ -948,11 +703,7 @@ pub async fn run_network(
             _ = gossip_warmup.tick() => {
                 retry_gossip_warmup_promotions(
                     &mut swarm,
-                    &peer_routes,
-                    &peer_direct_addresses,
-                    &mut direct_promotion_backoffs,
-                    &chat_subscribers,
-                    &mut gossip_warmups,
+                    &mut connections,
                     &ui,
                 )
                 .await;
@@ -992,24 +743,13 @@ pub async fn run_network(
                     pending_sync_summaries: &mut pending_sync_summaries,
                     http_client: &http_client,
                     audio_player: &mut audio_player,
-                    playback_state: &mut playback_state,
-                    pending_playback: &mut pending_playback,
-                    playback_version: &mut playback_version,
-                    music_queue: &mut music_queue,
-                    queue_version: &mut queue_version,
-                    queue_updated_at: &mut queue_updated_at,
-                    active_vote: &mut active_vote,
+                    music: &mut music,
                 };
                 handle_swarm_event(
                     event,
                     &mut swarm,
                     &ui,
-                    &mut explicit_peers,
-                    &mut peer_routes,
-                    &mut chat_subscribers,
-                    &mut peer_direct_addresses,
-                    &mut direct_promotion_backoffs,
-                    &mut gossip_warmups,
+                    &mut connections,
                     &rendezvous_nodes,
                     &rendezvous_namespace,
                     &mut rendezvous_cookies,
@@ -1060,25 +800,100 @@ struct HistoryContext<'a> {
     pending_sync_summaries: &'a mut VecDeque<Instant>,
     http_client: &'a reqwest::Client,
     audio_player: &'a mut Option<player::AudioPlayer>,
-    playback_state: &'a mut Option<PlaybackState>,
-    pending_playback: &'a mut Option<PendingPlayback>,
-    playback_version: &'a mut u64,
-    music_queue: &'a mut VecDeque<QueueItem>,
-    queue_version: &'a mut u64,
-    queue_updated_at: &'a mut i64,
-    active_vote: &'a mut Option<ActiveVote>,
+    music: &'a mut MusicState,
+}
+
+async fn apply_connection_effects(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    connections: &mut ConnectionState,
+    ui: &mpsc::Sender<UiEvent>,
+    effects: Vec<ConnectionEffect>,
+) {
+    let mut pending = VecDeque::from(effects);
+    while let Some(effect) = pending.pop_front() {
+        match effect {
+            ConnectionEffect::Status(status) => send_status(ui, status).await,
+            ConnectionEffect::TrackGossipPeer(peer_id) => {
+                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+            }
+            ConnectionEffect::UntrackGossipPeer(peer_id) => {
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .remove_explicit_peer(&peer_id);
+            }
+            ConnectionEffect::ResetBackoff(_) => {}
+            ConnectionEffect::DialDirect { peer_id, addresses } => {
+                let dial_opts = DialOpts::peer_id(peer_id)
+                    .addresses(addresses)
+                    .condition(PeerCondition::Always)
+                    .build();
+                if let Err(err) = swarm.dial(dial_opts) {
+                    pending.extend(connections.record_direct_promotion_failure(
+                        peer_id,
+                        format!("dial request failed: {err}"),
+                        Instant::now(),
+                    ));
+                }
+            }
+            ConnectionEffect::CloseRelayConnections {
+                peer_id,
+                connection_ids,
+                reason,
+            } => {
+                let closed_relays = connection_ids
+                    .into_iter()
+                    .filter(|connection_id| swarm.close_connection(*connection_id))
+                    .count();
+                if closed_relays > 0 {
+                    let status = match reason {
+                        RelayCloseReason::DirectPromotion => {
+                            format!(
+                                "promoted {peer_id} to direct connection; closing {closed_relays} relay link(s)"
+                            )
+                        }
+                        RelayCloseReason::ChatReady => {
+                            format!(
+                                "chat ready with {peer_id}; closing {closed_relays} relay link(s)"
+                            )
+                        }
+                    };
+                    send_status(ui, status).await;
+                } else if matches!(reason, RelayCloseReason::DirectPromotion) {
+                    send_status(ui, format!("connected {peer_id} directly")).await;
+                }
+            }
+            ConnectionEffect::CloseEarlyDirectConnection {
+                peer_id,
+                connection_id,
+            } => {
+                if swarm.close_connection(connection_id) {
+                    send_status(
+                        ui,
+                        format!(
+                            "closed early direct connection to {peer_id}; waiting for chat subscription or warmup timeout"
+                        ),
+                    )
+                    .await;
+                } else {
+                    send_status(
+                        ui,
+                        format!(
+                            "early direct connection to {peer_id} is waiting for chat subscription or warmup timeout"
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
 }
 
 async fn handle_swarm_event(
     event: SwarmEvent<BehaviourEvent>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     ui: &mpsc::Sender<UiEvent>,
-    explicit_peers: &mut HashSet<PeerId>,
-    peer_routes: &mut HashMap<PeerId, PeerConnectionRoutes>,
-    chat_subscribers: &mut HashSet<PeerId>,
-    peer_direct_addresses: &mut HashMap<PeerId, HashSet<Multiaddr>>,
-    direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
-    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
+    connections: &mut ConnectionState,
     rendezvous_nodes: &HashSet<PeerId>,
     rendezvous_namespace: &rendezvous::Namespace,
     rendezvous_cookies: &mut HashMap<PeerId, rendezvous::Cookie>,
@@ -1106,98 +921,14 @@ async fn handle_swarm_event(
         } => {
             let is_relayed =
                 endpoint.is_relayed() || is_relay_address(endpoint.get_remote_address());
-            peer_routes
-                .entry(peer_id)
-                .or_default()
-                .add(connection_id, is_relayed);
-
-            if !rendezvous_nodes.contains(&peer_id) && explicit_peers.insert(peer_id) {
-                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                send_status(ui, format!("tracking {peer_id} as gossip peer")).await;
-            }
-
-            if is_relayed {
-                send_status(ui, format!("connected {peer_id} via relay")).await;
-                if !rendezvous_nodes.contains(&peer_id)
-                    && !chat_subscribers.contains(&peer_id)
-                    && start_gossip_warmup(gossip_warmups, peer_id)
-                {
-                    send_status(
-                        ui,
-                        format!(
-                            "waiting up to {} for {peer_id} to subscribe to chat before direct promotion",
-                            format_retry_duration(GOSSIP_WARMUP_TIMEOUT)
-                        ),
-                    )
-                    .await;
-                }
-                maybe_promote_relayed_peer(
-                    swarm,
-                    peer_routes,
-                    peer_direct_addresses,
-                    direct_promotion_backoffs,
-                    chat_subscribers,
-                    gossip_warmups,
-                    peer_id,
-                    ui,
-                )
-                .await;
-            } else {
-                let has_relayed_route = peer_routes
-                    .get(&peer_id)
-                    .is_some_and(PeerConnectionRoutes::has_relayed);
-                let promotion_allowed = if has_relayed_route && !chat_subscribers.contains(&peer_id)
-                {
-                    gossip_warmup_allows_promotion(peer_id, chat_subscribers, gossip_warmups, ui)
-                        .await
-                } else {
-                    true
-                };
-
-                if promotion_allowed {
-                    direct_promotion_backoffs.remove(&peer_id);
-                    if chat_subscribers.contains(&peer_id) {
-                        let closed_relays = close_relay_connections(swarm, peer_routes, peer_id);
-                        if closed_relays > 0 {
-                            send_status(
-                                ui,
-                                format!(
-                                    "promoted {peer_id} to direct connection; closing {closed_relays} relay link(s)"
-                                ),
-                            )
-                            .await;
-                        } else {
-                            send_status(ui, format!("connected {peer_id} directly")).await;
-                        }
-                    } else if has_relayed_route {
-                        send_status(
-                            ui,
-                            format!(
-                                "promoted {peer_id} to direct connection after gossip warmup timeout; keeping relay until chat subscription is ready"
-                            ),
-                        )
-                        .await;
-                    } else {
-                        send_status(ui, format!("connected {peer_id} directly")).await;
-                    }
-                } else if swarm.close_connection(connection_id) {
-                    send_status(
-                        ui,
-                        format!(
-                            "closed early direct connection to {peer_id}; waiting for chat subscription or warmup timeout"
-                        ),
-                    )
-                    .await;
-                } else {
-                    send_status(
-                        ui,
-                        format!(
-                            "early direct connection to {peer_id} is waiting for chat subscription or warmup timeout"
-                        ),
-                    )
-                    .await;
-                }
-            }
+            let effects = connections.connection_established(
+                peer_id,
+                connection_id,
+                is_relayed,
+                rendezvous_nodes.contains(&peer_id),
+                Instant::now(),
+            );
+            apply_connection_effects(swarm, connections, ui, effects).await;
 
             if rendezvous_nodes.contains(&peer_id) {
                 register_with_rendezvous_node(swarm, peer_id, rendezvous_namespace, ui).await;
@@ -1216,15 +947,8 @@ async fn handle_swarm_event(
             if let Err(err) = trigger_sync(swarm, &mut ctx) {
                 send_status(ui, format!("sync summary failed: {err}")).await;
             }
-            if let Err(err) = publish_music_snapshot(
-                swarm,
-                ctx.topic,
-                ctx.local_peer_id,
-                *ctx.queue_version,
-                *ctx.queue_updated_at,
-                ctx.music_queue,
-                ctx.playback_state.as_ref(),
-            ) {
+            if let Err(err) = publish_music_snapshot(swarm, ctx.topic, ctx.local_peer_id, ctx.music)
+            {
                 send_status(ui, format!("music snapshot failed: {err}")).await;
             }
         }
@@ -1237,33 +961,11 @@ async fn handle_swarm_event(
         } => {
             let was_relayed =
                 endpoint.is_relayed() || is_relay_address(endpoint.get_remote_address());
-            if let Some(routes) = peer_routes.get_mut(&peer_id) {
-                routes.remove(connection_id, was_relayed);
-                if routes.is_empty() {
-                    peer_routes.remove(&peer_id);
-                }
-            }
+            let effects =
+                connections.connection_closed(peer_id, connection_id, was_relayed, num_established);
+            apply_connection_effects(swarm, connections, ui, effects).await;
 
-            if num_established > 0 {
-                let route = if was_relayed { "relay" } else { "direct" };
-                send_status(
-                    ui,
-                    format!(
-                        "{route} connection closed {peer_id}; {num_established} link(s) remain"
-                    ),
-                )
-                .await;
-            } else {
-                direct_promotion_backoffs.remove(&peer_id);
-                chat_subscribers.remove(&peer_id);
-                gossip_warmups.remove(&peer_id);
-                if explicit_peers.remove(&peer_id) {
-                    swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .remove_explicit_peer(&peer_id);
-                }
-                send_status(ui, format!("disconnected {peer_id}")).await;
+            if num_established == 0 {
                 if forget_peer_name(
                     peer_id,
                     ctx.local_peer_id,
@@ -1276,20 +978,11 @@ async fn handle_swarm_event(
                 }
                 let count = swarm.connected_peers().count();
                 let _ = ui.send(UiEvent::PeerCount(count)).await;
-                if let Some(pending) = ctx.pending_playback.as_mut() {
-                    let peer_id = peer_id.to_string();
-                    pending.expected_peers.remove(&peer_id);
-                    pending.ready_peers.remove(&peer_id);
-                }
-                if let Err(err) = maybe_start_pending_playback(
-                    &mut *ctx.pending_playback,
-                    &mut *ctx.playback_state,
-                    &mut *ctx.playback_version,
-                    swarm,
-                    ctx.topic,
-                    ui,
-                )
-                .await
+                let peer_id = peer_id.to_string();
+                ctx.music.remove_pending_peer(&peer_id);
+                if let Err(err) =
+                    maybe_start_pending_playback(ctx.music, swarm, ctx.topic, ctx.local_peer_id, ui)
+                        .await
                 {
                     send_status(ui, format!("playback start failed: {err:#}")).await;
                 }
@@ -1297,51 +990,31 @@ async fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
             let mut discovered = false;
-            let mut direct_candidates = HashSet::new();
             for (peer_id, address) in list {
                 discovered = true;
-                if explicit_peers.insert(peer_id) {
-                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                }
-                if remember_direct_addresses(peer_direct_addresses, peer_id, [address]) > 0 {
-                    direct_promotion_backoffs.remove(&peer_id);
-                    direct_candidates.insert(peer_id);
-                }
-                send_status(ui, format!("mDNS discovered {peer_id}")).await;
-            }
-            for peer_id in direct_candidates {
-                maybe_promote_relayed_peer(
-                    swarm,
-                    peer_routes,
-                    peer_direct_addresses,
-                    direct_promotion_backoffs,
-                    chat_subscribers,
-                    gossip_warmups,
+                let mut effects = connections.track_gossip_peer(peer_id, None);
+                effects.extend(connections.learn_direct_addresses(
                     peer_id,
-                    ui,
-                )
-                .await;
+                    [address],
+                    Instant::now(),
+                ));
+                apply_connection_effects(swarm, connections, ui, effects).await;
+                send_status(ui, format!("mDNS discovered {peer_id}")).await;
             }
             if discovered {
                 if let Err(err) = trigger_sync(swarm, &mut ctx) {
                     send_status(ui, format!("sync summary failed: {err}")).await;
                 }
-                if let Err(err) = publish_music_snapshot(
-                    swarm,
-                    ctx.topic,
-                    ctx.local_peer_id,
-                    *ctx.queue_version,
-                    *ctx.queue_updated_at,
-                    ctx.music_queue,
-                    ctx.playback_state.as_ref(),
-                ) {
+                if let Err(err) =
+                    publish_music_snapshot(swarm, ctx.topic, ctx.local_peer_id, ctx.music)
+                {
                     send_status(ui, format!("music snapshot failed: {err}")).await;
                 }
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
             for (peer_id, address) in list {
-                forget_direct_address(peer_direct_addresses, peer_id, address);
+                connections.forget_direct_address(peer_id, address);
                 if forget_peer_name(
                     peer_id,
                     ctx.local_peer_id,
@@ -1352,49 +1025,24 @@ async fn handle_swarm_event(
                 ) {
                     send_status(ui, format!("name '{}' is available again", ctx.local_name)).await;
                 }
-                if !is_peer_connected(swarm, peer_id) && explicit_peers.remove(&peer_id) {
-                    swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .remove_explicit_peer(&peer_id);
+                if !is_peer_connected(swarm, peer_id) {
+                    let effects = connections.untrack_gossip_peer(peer_id);
+                    apply_connection_effects(swarm, connections, ui, effects).await;
                 }
                 send_status(ui, format!("mDNS expired {peer_id}")).await;
             }
         }
         SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
-            if remember_direct_addresses(peer_direct_addresses, peer_id, [address]) > 0 {
-                direct_promotion_backoffs.remove(&peer_id);
-                maybe_promote_relayed_peer(
-                    swarm,
-                    peer_routes,
-                    peer_direct_addresses,
-                    direct_promotion_backoffs,
-                    chat_subscribers,
-                    gossip_warmups,
-                    peer_id,
-                    ui,
-                )
-                .await;
-            }
+            let effects = connections.learn_direct_addresses(peer_id, [address], Instant::now());
+            apply_connection_effects(swarm, connections, ui, effects).await;
         }
         SwarmEvent::Behaviour(BehaviourEvent::Identify(
             identify::Event::Received { peer_id, info, .. }
             | identify::Event::Pushed { peer_id, info, .. },
         )) => {
-            if remember_direct_addresses(peer_direct_addresses, peer_id, info.listen_addrs) > 0 {
-                direct_promotion_backoffs.remove(&peer_id);
-                maybe_promote_relayed_peer(
-                    swarm,
-                    peer_routes,
-                    peer_direct_addresses,
-                    direct_promotion_backoffs,
-                    chat_subscribers,
-                    gossip_warmups,
-                    peer_id,
-                    ui,
-                )
-                .await;
-            }
+            let effects =
+                connections.learn_direct_addresses(peer_id, info.listen_addrs, Instant::now());
+            apply_connection_effects(swarm, connections, ui, effects).await;
         }
         SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Error {
             peer_id,
@@ -1439,12 +1087,7 @@ async fn handle_swarm_event(
             rendezvous_cookies.insert(rendezvous_node, cookie);
             let count = dial_rendezvous_registrations(
                 swarm,
-                explicit_peers,
-                peer_direct_addresses,
-                direct_promotion_backoffs,
-                chat_subscribers,
-                gossip_warmups,
-                peer_routes,
+                connections,
                 ctx.local_peer_id,
                 registrations,
                 ui,
@@ -1482,37 +1125,10 @@ async fn handle_swarm_event(
             topic,
         })) => {
             if topic == ctx.topic.hash() {
-                chat_subscribers.insert(peer_id);
-                gossip_warmups.remove(&peer_id);
-                send_status(ui, format!("peer {peer_id} subscribed to chat")).await;
+                let effects = connections.chat_subscribed(peer_id, Instant::now());
+                apply_connection_effects(swarm, connections, ui, effects).await;
                 if let Err(err) = trigger_sync(swarm, &mut ctx) {
                     send_status(ui, format!("sync summary failed: {err}")).await;
-                }
-                maybe_promote_relayed_peer(
-                    swarm,
-                    peer_routes,
-                    peer_direct_addresses,
-                    direct_promotion_backoffs,
-                    chat_subscribers,
-                    gossip_warmups,
-                    peer_id,
-                    ui,
-                )
-                .await;
-                if peer_routes
-                    .get(&peer_id)
-                    .is_some_and(PeerConnectionRoutes::has_direct)
-                {
-                    let closed_relays = close_relay_connections(swarm, peer_routes, peer_id);
-                    if closed_relays > 0 {
-                        send_status(
-                            ui,
-                            format!(
-                                "chat ready with {peer_id}; closing {closed_relays} relay link(s)"
-                            ),
-                        )
-                        .await;
-                    }
                 }
             }
         }
@@ -1521,8 +1137,8 @@ async fn handle_swarm_event(
             topic,
         })) => {
             if topic == ctx.topic.hash() {
-                chat_subscribers.remove(&peer_id);
-                send_status(ui, format!("peer {peer_id} unsubscribed from chat")).await;
+                let effects = connections.chat_unsubscribed(peer_id);
+                apply_connection_effects(swarm, connections, ui, effects).await;
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
@@ -1729,16 +1345,16 @@ async fn handle_swarm_event(
                     && is_queue_state_newer(
                         version,
                         updated_at_micros,
-                        *ctx.queue_version,
-                        *ctx.queue_updated_at,
+                        ctx.music.queue_version,
+                        ctx.music.queue_updated_at,
                     )
                     && should_request_queue(ctx.queue_request_times, &peer_id)
                 {
                     let request = WireMessage::QueueRequest {
                         requester: local_peer_id,
                         target: peer_id.clone(),
-                        known_version: *ctx.queue_version,
-                        known_updated_at_micros: *ctx.queue_updated_at,
+                        known_version: ctx.music.queue_version,
+                        known_updated_at_micros: ctx.music.queue_updated_at,
                         nonce: new_nonce(ctx.local_peer_id),
                     };
 
@@ -1765,20 +1381,15 @@ async fn handle_swarm_event(
                 if target == local_peer_id
                     && requester != local_peer_id
                     && is_queue_state_newer(
-                        *ctx.queue_version,
-                        *ctx.queue_updated_at,
+                        ctx.music.queue_version,
+                        ctx.music.queue_updated_at,
                         known_version,
                         known_updated_at_micros,
                     )
                 {
                     let response = WireMessage::QueueResponse {
                         target: requester.clone(),
-                        state: build_queue_state(
-                            *ctx.queue_version,
-                            *ctx.queue_updated_at,
-                            ctx.local_peer_id,
-                            ctx.music_queue,
-                        ),
+                        state: build_queue_state(ctx.local_peer_id, ctx.music),
                         nonce: new_nonce(ctx.local_peer_id),
                     };
 
@@ -1786,7 +1397,7 @@ async fn handle_swarm_event(
                         Ok(()) => {
                             send_status(
                                 ui,
-                                format!("sent {} queue item(s)", ctx.music_queue.len()),
+                                format!("sent {} queue item(s)", ctx.music.queue.len()),
                             )
                             .await;
                         }
@@ -1804,10 +1415,10 @@ async fn handle_swarm_event(
             Ok(WireMessage::PlaybackState { state, .. }) => {
                 let state = normalize_remote_playback_state(&state, current_timestamp_micros());
                 if state.leader_peer_id != ctx.local_peer_id.to_string()
-                    && should_apply_playback_state(ctx.playback_state.as_ref(), &state)
+                    && should_apply_playback_state(ctx.music.playback_state(), &state)
                 {
                     cancel_local_pending_playback(
-                        &mut *ctx.pending_playback,
+                        ctx.music,
                         swarm,
                         ctx.topic,
                         ctx.local_peer_id,
@@ -1816,7 +1427,7 @@ async fn handle_swarm_event(
                     match apply_remote_playback_state(
                         ctx.http_client,
                         &mut *ctx.audio_player,
-                        &mut *ctx.playback_state,
+                        ctx.music,
                         &state,
                         ui,
                     )
@@ -1839,10 +1450,10 @@ async fn handle_swarm_event(
                     || expected_peers.contains(&ctx.local_peer_id.to_string());
                 if state.leader_peer_id != ctx.local_peer_id.to_string()
                     && is_expected
-                    && should_apply_playback_state(ctx.playback_state.as_ref(), &state)
+                    && should_apply_playback_state(ctx.music.playback_state(), &state)
                 {
                     cancel_local_pending_playback(
-                        &mut *ctx.pending_playback,
+                        ctx.music,
                         swarm,
                         ctx.topic,
                         ctx.local_peer_id,
@@ -1851,7 +1462,7 @@ async fn handle_swarm_event(
                     match apply_playback_prepare(
                         ctx.http_client,
                         &mut *ctx.audio_player,
-                        &mut *ctx.playback_state,
+                        ctx.music,
                         &state,
                         ui,
                     )
@@ -1886,32 +1497,19 @@ async fn handle_swarm_event(
                 peer_id,
                 ..
             }) => {
-                if let Some(pending) = ctx.pending_playback.as_mut() {
-                    if pending.state.session_id == session_id
-                        && pending.state.leader_peer_id == ctx.local_peer_id.to_string()
-                        && pending.mark_ready(peer_id.clone())
-                    {
-                        send_status(
-                            ui,
-                            format!(
-                                "peer {peer_id} ready ({}/{})",
-                                pending.ready_count(),
-                                pending.expected_count()
-                            ),
-                        )
-                        .await;
+                match ctx
+                    .music
+                    .mark_playback_ready(&session_id, &peer_id, ctx.local_peer_id)
+                {
+                    PlaybackReadyOutcome::Marked { ready, expected } => {
+                        send_status(ui, format!("peer {peer_id} ready ({ready}/{expected})")).await;
                     }
+                    PlaybackReadyOutcome::Ignored => {}
                 }
 
-                if let Err(err) = maybe_start_pending_playback(
-                    &mut *ctx.pending_playback,
-                    &mut *ctx.playback_state,
-                    &mut *ctx.playback_version,
-                    swarm,
-                    ctx.topic,
-                    ui,
-                )
-                .await
+                if let Err(err) =
+                    maybe_start_pending_playback(ctx.music, swarm, ctx.topic, ctx.local_peer_id, ui)
+                        .await
                 {
                     send_status(ui, format!("playback start failed: {err:#}")).await;
                 }
@@ -1925,7 +1523,7 @@ async fn handle_swarm_event(
                 if leader_peer_id != ctx.local_peer_id.to_string() {
                     apply_playback_cancel(
                         &mut *ctx.audio_player,
-                        &mut *ctx.playback_state,
+                        ctx.music,
                         &session_id,
                         &reason,
                         ui,
@@ -1940,32 +1538,41 @@ async fn handle_swarm_event(
                 if proposal.proposer == ctx.local_peer_id.to_string() {
                     return;
                 }
-                if ctx.active_vote.is_some() {
-                    send_status(
-                        ui,
-                        format!("ignored vote {}; another vote is active", proposal.vote_id),
-                    )
-                    .await;
-                } else {
-                    let mut vote = ActiveVote::new(proposal.clone(), Instant::now() + VOTE_TIMEOUT);
-                    vote.vote(proposal.proposer.clone(), true);
-                    *ctx.active_vote = Some(vote);
-                    send_vote_view(
-                        ui,
-                        ctx.active_vote.as_ref(),
-                        ctx.music_queue,
-                        majority_threshold(swarm.connected_peers().count() + 1),
-                    )
-                    .await;
-                    send_status(
-                        ui,
-                        format!(
-                            "vote requested by {}: {} (/vote yes|no)",
-                            short_peer(&proposal.proposer),
-                            describe_vote_action(&proposal.action, ctx.music_queue)
-                        ),
-                    )
-                    .await;
+                match ctx
+                    .music
+                    .receive_vote_proposal(proposal.clone(), Instant::now() + VOTE_TIMEOUT)
+                {
+                    Ok(()) => {
+                        send_vote_view(
+                            ui,
+                            ctx.music,
+                            majority_threshold(swarm.connected_peers().count() + 1),
+                        )
+                        .await;
+                        send_status(
+                            ui,
+                            format!(
+                                "vote requested by {}: {} (/vote yes|no)",
+                                short_peer(&proposal.proposer),
+                                describe_vote_action(&proposal.action, &ctx.music.queue)
+                            ),
+                        )
+                        .await;
+                    }
+                    Err("another vote is active") => {
+                        send_status(
+                            ui,
+                            format!("ignored vote {}; another vote is active", proposal.vote_id),
+                        )
+                        .await;
+                    }
+                    Err(reason) => {
+                        send_status(
+                            ui,
+                            format!("ignored stale vote {}: {reason}", proposal.vote_id),
+                        )
+                        .await;
+                    }
                 }
             }
             Ok(WireMessage::VoteBallot {
@@ -1976,10 +1583,9 @@ async fn handle_swarm_event(
             }) => {
                 let mut changed_vote = false;
                 let threshold = majority_threshold(swarm.connected_peers().count() + 1);
-                if let Some(vote) = ctx.active_vote.as_mut() {
-                    if vote.proposal.vote_id == vote_id {
-                        vote.vote(peer_id.clone(), approve);
-                        changed_vote = true;
+                if ctx.music.cast_vote_for(&vote_id, peer_id.clone(), approve) {
+                    changed_vote = true;
+                    if let Some(vote) = ctx.music.active_vote.as_ref() {
                         send_status(
                             ui,
                             format!(
@@ -1994,17 +1600,11 @@ async fn handle_swarm_event(
                     }
                 }
                 if changed_vote {
-                    send_vote_view(ui, ctx.active_vote.as_ref(), ctx.music_queue, threshold).await;
+                    send_vote_view(ui, ctx.music, threshold).await;
                 }
 
                 if let Err(err) = resolve_active_vote(
-                    ctx.active_vote,
-                    ctx.music_queue,
-                    ctx.queue_version,
-                    ctx.queue_updated_at,
-                    ctx.pending_playback,
-                    ctx.playback_state,
-                    ctx.playback_version,
+                    ctx.music,
                     ctx.audio_player,
                     ctx.http_client,
                     swarm,
@@ -2024,53 +1624,27 @@ async fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => match event.result {
             Ok(connection_id) => {
-                direct_promotion_backoffs.remove(&event.remote_peer_id);
-                send_status(
-                    ui,
-                    format!(
-                        "direct upgrade succeeded with {} on {connection_id:?}",
-                        event.remote_peer_id
-                    ),
-                )
-                .await;
+                let mut effects = connections.dcutr_succeeded(event.remote_peer_id);
+                effects.push(ConnectionEffect::Status(format!(
+                    "direct upgrade succeeded with {} on {connection_id:?}",
+                    event.remote_peer_id
+                )));
+                apply_connection_effects(swarm, connections, ui, effects).await;
             }
             Err(err) => {
-                if peer_routes
-                    .get(&event.remote_peer_id)
-                    .is_some_and(PeerConnectionRoutes::is_relay_only)
-                {
-                    record_direct_promotion_failure(
-                        direct_promotion_backoffs,
-                        event.remote_peer_id,
-                        format!("DCUtR failed: {err}"),
-                        ui,
-                    )
-                    .await;
-                } else {
-                    send_status(
-                        ui,
-                        format!("direct upgrade failed with {}: {err}", event.remote_peer_id),
-                    )
-                    .await;
-                }
+                let effects =
+                    connections.dcutr_failed(event.remote_peer_id, err.to_string(), Instant::now());
+                apply_connection_effects(swarm, connections, ui, effects).await;
             }
         },
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             if let Some(peer_id) = peer_id {
-                if direct_promotion_backoffs
-                    .get(&peer_id)
-                    .is_some_and(|backoff| backoff.in_flight)
-                {
-                    record_direct_promotion_failure(
-                        direct_promotion_backoffs,
-                        peer_id,
-                        format!("outgoing direct dial failed: {error}"),
-                        ui,
-                    )
-                    .await;
-                } else {
-                    send_status(ui, format!("outgoing connection error {peer_id}: {error}")).await;
-                }
+                let effects = connections.outgoing_connection_error(
+                    peer_id,
+                    format!("outgoing direct dial failed: {error}"),
+                    Instant::now(),
+                );
+                apply_connection_effects(swarm, connections, ui, effects).await;
             } else {
                 send_status(
                     ui,
@@ -2085,56 +1659,20 @@ async fn handle_swarm_event(
 
 async fn retry_direct_promotions(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
-    peer_direct_addresses: &HashMap<PeerId, HashSet<Multiaddr>>,
-    direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
-    chat_subscribers: &HashSet<PeerId>,
-    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
+    connections: &mut ConnectionState,
     ui: &mpsc::Sender<UiEvent>,
 ) {
-    let peers = peer_routes.keys().copied().collect::<Vec<_>>();
-    for peer_id in peers {
-        maybe_promote_relayed_peer(
-            swarm,
-            peer_routes,
-            peer_direct_addresses,
-            direct_promotion_backoffs,
-            chat_subscribers,
-            gossip_warmups,
-            peer_id,
-            ui,
-        )
-        .await;
-    }
+    let effects = connections.promotion_tick(Instant::now());
+    apply_connection_effects(swarm, connections, ui, effects).await;
 }
 
 async fn retry_gossip_warmup_promotions(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
-    peer_direct_addresses: &HashMap<PeerId, HashSet<Multiaddr>>,
-    direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
-    chat_subscribers: &HashSet<PeerId>,
-    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
+    connections: &mut ConnectionState,
     ui: &mpsc::Sender<UiEvent>,
 ) {
-    let peers = gossip_warmups
-        .iter()
-        .filter_map(|(peer_id, warmup)| warmup.is_expired().then_some(*peer_id))
-        .collect::<Vec<_>>();
-
-    for peer_id in peers {
-        maybe_promote_relayed_peer(
-            swarm,
-            peer_routes,
-            peer_direct_addresses,
-            direct_promotion_backoffs,
-            chat_subscribers,
-            gossip_warmups,
-            peer_id,
-            ui,
-        )
-        .await;
-    }
+    let effects = connections.warmup_tick(Instant::now());
+    apply_connection_effects(swarm, connections, ui, effects).await;
 }
 
 async fn register_with_rendezvous_nodes(
@@ -2232,12 +1770,7 @@ async fn discover_rendezvous_node(
 
 async fn dial_rendezvous_registrations(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    explicit_peers: &mut HashSet<PeerId>,
-    peer_direct_addresses: &mut HashMap<PeerId, HashSet<Multiaddr>>,
-    direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
-    chat_subscribers: &HashSet<PeerId>,
-    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
-    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
+    connections: &mut ConnectionState,
     local_peer_id: PeerId,
     registrations: Vec<rendezvous::Registration>,
     ui: &mpsc::Sender<UiEvent>,
@@ -2260,26 +1793,18 @@ async fn dial_rendezvous_registrations(
         }
         discovered += 1;
 
-        if explicit_peers.insert(peer_id) {
-            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-            send_status(ui, format!("tracking {peer_id} as rendezvous gossip peer")).await;
-        }
-        if remember_direct_addresses(peer_direct_addresses, peer_id, addresses.clone()) > 0 {
-            direct_promotion_backoffs.remove(&peer_id);
-        }
+        let mut effects = connections.track_gossip_peer(
+            peer_id,
+            Some(format!("tracking {peer_id} as rendezvous gossip peer")),
+        );
+        effects.extend(connections.learn_direct_addresses(
+            peer_id,
+            addresses.clone(),
+            Instant::now(),
+        ));
+        apply_connection_effects(swarm, connections, ui, effects).await;
 
         if is_peer_connected(swarm, peer_id) {
-            maybe_promote_relayed_peer(
-                swarm,
-                peer_routes,
-                peer_direct_addresses,
-                direct_promotion_backoffs,
-                chat_subscribers,
-                gossip_warmups,
-                peer_id,
-                ui,
-            )
-            .await;
             continue;
         }
 
@@ -2311,198 +1836,6 @@ async fn dial_rendezvous_registrations(
     discovered
 }
 
-fn start_gossip_warmup(
-    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
-    peer_id: PeerId,
-) -> bool {
-    if gossip_warmups.contains_key(&peer_id) {
-        return false;
-    }
-
-    gossip_warmups.insert(peer_id, GossipsubWarmup::new());
-    true
-}
-
-async fn gossip_warmup_allows_promotion(
-    peer_id: PeerId,
-    chat_subscribers: &HashSet<PeerId>,
-    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
-    ui: &mpsc::Sender<UiEvent>,
-) -> bool {
-    if chat_subscribers.contains(&peer_id) {
-        gossip_warmups.remove(&peer_id);
-        return true;
-    }
-
-    let Some(warmup) = gossip_warmups.get(&peer_id) else {
-        gossip_warmups.insert(peer_id, GossipsubWarmup::new());
-        send_status(
-            ui,
-            format!(
-                "waiting up to {} for {peer_id} to subscribe to chat before direct promotion",
-                format_retry_duration(GOSSIP_WARMUP_TIMEOUT)
-            ),
-        )
-        .await;
-        return false;
-    };
-    if !warmup.is_expired() {
-        return false;
-    }
-
-    gossip_warmups.remove(&peer_id);
-    send_status(
-        ui,
-        format!("gossipsub warmup timed out for {peer_id}; trying direct promotion anyway"),
-    )
-    .await;
-    true
-}
-
-async fn maybe_promote_relayed_peer(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
-    peer_direct_addresses: &HashMap<PeerId, HashSet<Multiaddr>>,
-    direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
-    chat_subscribers: &HashSet<PeerId>,
-    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
-    peer_id: PeerId,
-    ui: &mpsc::Sender<UiEvent>,
-) {
-    if peer_id == *swarm.local_peer_id() {
-        return;
-    }
-    if !peer_routes
-        .get(&peer_id)
-        .is_some_and(PeerConnectionRoutes::is_relay_only)
-    {
-        return;
-    }
-
-    let Some(addresses) = peer_direct_addresses.get(&peer_id) else {
-        return;
-    };
-    if addresses.is_empty() {
-        return;
-    }
-
-    if !gossip_warmup_allows_promotion(peer_id, chat_subscribers, gossip_warmups, ui).await {
-        return;
-    }
-
-    let suspended_failures = {
-        let backoff = direct_promotion_backoffs.entry(peer_id).or_default();
-        if backoff.failures >= DIRECT_PROMOTION_MAX_FAILURES {
-            if backoff.suspended_reported {
-                return;
-            }
-            backoff.suspended_reported = true;
-            Some(backoff.failures)
-        } else {
-            if !backoff.should_attempt() {
-                return;
-            }
-            backoff.mark_attempt();
-            None
-        }
-    };
-    if let Some(failures) = suspended_failures {
-        send_status(
-            ui,
-            format!(
-                "direct promotion suspended for {peer_id} after {failures} failures; waiting for new direct addresses"
-            ),
-        )
-        .await;
-        return;
-    }
-
-    let addresses = prioritize_multiaddrs(addresses.iter().cloned().collect());
-    let address_count = addresses.len();
-    let dial_opts = DialOpts::peer_id(peer_id)
-        .addresses(addresses)
-        .condition(PeerCondition::Always)
-        .build();
-
-    match swarm.dial(dial_opts) {
-        Ok(()) => {
-            send_status(
-                ui,
-                format!(
-                    "trying direct connection to {peer_id} ({address_count} candidate address(es))"
-                ),
-            )
-            .await;
-        }
-        Err(err) => {
-            record_direct_promotion_failure(
-                direct_promotion_backoffs,
-                peer_id,
-                format!("dial request failed: {err}"),
-                ui,
-            )
-            .await;
-        }
-    }
-}
-
-async fn record_direct_promotion_failure(
-    direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
-    peer_id: PeerId,
-    reason: String,
-    ui: &mpsc::Sender<UiEvent>,
-) {
-    let outcome = direct_promotion_backoffs
-        .entry(peer_id)
-        .or_default()
-        .mark_failure();
-
-    let DirectPromotionFailureOutcome::Counted {
-        failures,
-        retry_after,
-    } = outcome
-    else {
-        return;
-    };
-
-    if let Some(retry_after) = retry_after {
-        send_status(
-            ui,
-            format!(
-                "direct promotion failed for {peer_id} ({failures}/{DIRECT_PROMOTION_MAX_FAILURES}): {reason}; retrying in {}",
-                format_retry_duration(retry_after)
-            ),
-        )
-        .await;
-    } else {
-        if let Some(backoff) = direct_promotion_backoffs.get_mut(&peer_id) {
-            backoff.suspended_reported = true;
-        }
-        send_status(
-            ui,
-            format!(
-                "direct promotion suspended for {peer_id} after {failures} failures: {reason}; waiting for new direct addresses"
-            ),
-        )
-        .await;
-    }
-}
-
-fn format_retry_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds < 60 {
-        return format!("{seconds}s");
-    }
-
-    let minutes = seconds / 60;
-    let seconds = seconds % 60;
-    if seconds == 0 {
-        format!("{minutes}m")
-    } else {
-        format!("{minutes}m {seconds}s")
-    }
-}
-
 fn is_peer_connected(swarm: &libp2p::Swarm<Behaviour>, peer_id: PeerId) -> bool {
     swarm
         .connected_peers()
@@ -2511,129 +1844,6 @@ fn is_peer_connected(swarm: &libp2p::Swarm<Behaviour>, peer_id: PeerId) -> bool 
 
 fn has_external_addresses(swarm: &libp2p::Swarm<Behaviour>) -> bool {
     swarm.external_addresses().next().is_some()
-}
-
-fn close_relay_connections(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
-    peer_id: PeerId,
-) -> usize {
-    let relay_connections = peer_routes
-        .get(&peer_id)
-        .map(PeerConnectionRoutes::relayed_connections)
-        .unwrap_or_default();
-
-    relay_connections
-        .into_iter()
-        .filter(|connection_id| swarm.close_connection(*connection_id))
-        .count()
-}
-
-fn remember_direct_addresses<I>(
-    peer_direct_addresses: &mut HashMap<PeerId, HashSet<Multiaddr>>,
-    peer_id: PeerId,
-    addresses: I,
-) -> usize
-where
-    I: IntoIterator<Item = Multiaddr>,
-{
-    let addresses = addresses
-        .into_iter()
-        .filter_map(|address| normalize_direct_peer_address(peer_id, address))
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return 0;
-    }
-
-    let known_addresses = peer_direct_addresses.entry(peer_id).or_default();
-    addresses
-        .into_iter()
-        .filter(|address| known_addresses.insert(address.clone()))
-        .count()
-}
-
-fn forget_direct_address(
-    peer_direct_addresses: &mut HashMap<PeerId, HashSet<Multiaddr>>,
-    peer_id: PeerId,
-    address: Multiaddr,
-) {
-    let Some(address) = normalize_direct_peer_address(peer_id, address) else {
-        return;
-    };
-    let Some(known_addresses) = peer_direct_addresses.get_mut(&peer_id) else {
-        return;
-    };
-
-    known_addresses.remove(&address);
-    if known_addresses.is_empty() {
-        peer_direct_addresses.remove(&peer_id);
-    }
-}
-
-fn normalize_peer_address(peer_id: PeerId, address: Multiaddr) -> Option<Multiaddr> {
-    if is_unspecified_ip_address(&address) {
-        return None;
-    }
-
-    let last_peer_id = address
-        .iter()
-        .filter_map(|protocol| match protocol {
-            libp2p::multiaddr::Protocol::P2p(address_peer_id) => Some(address_peer_id),
-            _ => None,
-        })
-        .last();
-
-    match last_peer_id {
-        Some(address_peer_id) if address_peer_id == peer_id => Some(address),
-        Some(_) => None,
-        None => Some(address.with(libp2p::multiaddr::Protocol::P2p(peer_id))),
-    }
-}
-
-fn normalize_direct_peer_address(peer_id: PeerId, address: Multiaddr) -> Option<Multiaddr> {
-    if is_relay_address(&address) || is_unspecified_ip_address(&address) {
-        return None;
-    }
-
-    let mut has_target_peer_id = false;
-    for protocol in address.iter() {
-        if let libp2p::multiaddr::Protocol::P2p(address_peer_id) = protocol {
-            if address_peer_id != peer_id {
-                return None;
-            }
-            has_target_peer_id = true;
-        }
-    }
-
-    if has_target_peer_id {
-        Some(address)
-    } else {
-        Some(address.with(libp2p::multiaddr::Protocol::P2p(peer_id)))
-    }
-}
-
-fn is_relay_address(address: &Multiaddr) -> bool {
-    address
-        .iter()
-        .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit))
-}
-
-fn is_unspecified_ip_address(address: &Multiaddr) -> bool {
-    address.iter().any(|protocol| match protocol {
-        libp2p::multiaddr::Protocol::Ip4(address) => address.is_unspecified(),
-        libp2p::multiaddr::Protocol::Ip6(address) => address.is_unspecified(),
-        _ => false,
-    })
-}
-
-fn peer_id_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {
-    address
-        .iter()
-        .filter_map(|protocol| match protocol {
-            libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
-            _ => None,
-        })
-        .last()
 }
 
 fn publish_history_summary(
@@ -2740,9 +1950,9 @@ fn trigger_sync(swarm: &mut libp2p::Swarm<Behaviour>, ctx: &mut HistoryContext<'
         ctx.local_name,
         ctx.local_joined_at,
         ctx.history,
-        *ctx.queue_version,
-        *ctx.queue_updated_at,
-        ctx.music_queue,
+        ctx.music.queue_version,
+        ctx.music.queue_updated_at,
+        &ctx.music.queue,
     )?;
     schedule_sync_burst(ctx.pending_sync_summaries);
     Ok(())
@@ -2936,55 +2146,35 @@ async fn apply_remote_queue_state(
     state: QueueState,
     status_prefix: &str,
 ) -> bool {
-    if !should_apply_queue_state(*ctx.queue_version, *ctx.queue_updated_at, &state) {
+    let Some(outcome) = ctx.music.apply_remote_queue_state(state) else {
         return false;
-    }
+    };
 
-    *ctx.music_queue = VecDeque::from(state.items.clone());
-    *ctx.queue_version = state.version;
-    *ctx.queue_updated_at = state.updated_at_micros;
-    let _ = ui.send(UiEvent::Queue(state.clone())).await;
+    let _ = ui.send(UiEvent::Queue(outcome.state.clone())).await;
+    if let Some(invalidated) = outcome.invalidated_vote {
+        let _ = ui.send(UiEvent::Vote(None)).await;
+        send_status(ui, format!("vote discarded: {}", invalidated.reason)).await;
+    }
     send_status(
         ui,
-        format!("{status_prefix} by {}", short_peer(&state.updated_by)),
+        format!(
+            "{status_prefix} by {}",
+            short_peer(&outcome.state.updated_by)
+        ),
     )
     .await;
-    send_queue_status(ui, ctx.playback_state.as_ref(), ctx.music_queue).await;
+    send_queue_status(ui, ctx.music.playback_state(), &ctx.music.queue).await;
     true
 }
 
-async fn send_queue_view(
-    ui: &mpsc::Sender<UiEvent>,
-    queue_version: u64,
-    queue_updated_at: i64,
-    local_peer_id: PeerId,
-    queue: &VecDeque<QueueItem>,
-) {
+async fn send_queue_view(ui: &mpsc::Sender<UiEvent>, local_peer_id: PeerId, music: &MusicState) {
     let _ = ui
-        .send(UiEvent::Queue(QueueState {
-            version: queue_version,
-            updated_at_micros: queue_updated_at,
-            updated_by: local_peer_id.to_string(),
-            items: queue.iter().cloned().collect(),
-        }))
+        .send(UiEvent::Queue(music.queue_state(local_peer_id)))
         .await;
 }
 
-async fn send_vote_view(
-    ui: &mpsc::Sender<UiEvent>,
-    vote: Option<&ActiveVote>,
-    queue: &VecDeque<QueueItem>,
-    threshold: usize,
-) {
-    let payload = vote.map(|vote| VoteView {
-        vote_id: vote.proposal.vote_id.clone(),
-        proposer: vote.proposal.proposer.clone(),
-        action_label: describe_vote_action(&vote.proposal.action, queue),
-        approvals: vote.approvals.len(),
-        rejections: vote.rejections.len(),
-        threshold,
-    });
-    let _ = ui.send(UiEvent::Vote(payload)).await;
+async fn send_vote_view(ui: &mpsc::Sender<UiEvent>, music: &MusicState, threshold: usize) {
+    let _ = ui.send(UiEvent::Vote(music.vote_view(threshold))).await;
 }
 
 async fn remember_peer_name(
@@ -3189,36 +2379,24 @@ fn publish_history_wire(
 fn publish_queue_state(
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
-    queue_version: &mut u64,
-    queue_updated_at: &mut i64,
+    music: &mut MusicState,
     local_peer_id: PeerId,
-    queue: &VecDeque<QueueItem>,
 ) -> Result<()> {
-    *queue_version += 1;
-    *queue_updated_at = current_timestamp_micros();
-    publish_queue_snapshot(
-        swarm,
-        topic,
-        *queue_version,
-        *queue_updated_at,
-        local_peer_id,
-        queue,
-    )
+    music.mark_queue_changed(current_timestamp_micros());
+    publish_queue_snapshot(swarm, topic, local_peer_id, music)
 }
 
 fn publish_queue_snapshot(
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
-    queue_version: u64,
-    queue_updated_at: i64,
     local_peer_id: PeerId,
-    queue: &VecDeque<QueueItem>,
+    music: &MusicState,
 ) -> Result<()> {
-    if queue_version == 0 && queue.is_empty() {
+    if music.queue_version == 0 && music.queue.is_empty() {
         return Ok(());
     }
 
-    let state = build_queue_state(queue_version, queue_updated_at, local_peer_id, queue);
+    let state = build_queue_state(local_peer_id, music);
 
     publish_history_wire(
         swarm,
@@ -3234,21 +2412,11 @@ fn publish_music_snapshot(
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     local_peer_id: PeerId,
-    queue_version: u64,
-    queue_updated_at: i64,
-    queue: &VecDeque<QueueItem>,
-    playback_state: Option<&PlaybackState>,
+    music: &MusicState,
 ) -> Result<()> {
-    publish_queue_snapshot(
-        swarm,
-        topic,
-        queue_version,
-        queue_updated_at,
-        local_peer_id,
-        queue,
-    )?;
+    publish_queue_snapshot(swarm, topic, local_peer_id, music)?;
 
-    if let Some(state) = playback_state {
+    if let Some(state) = music.playback_state() {
         if state.leader_peer_id == local_peer_id.to_string() {
             publish_playback_state(swarm, topic, state)?;
         }
@@ -3257,46 +2425,12 @@ fn publish_music_snapshot(
     Ok(())
 }
 
-fn build_queue_state(
-    queue_version: u64,
-    queue_updated_at: i64,
-    local_peer_id: PeerId,
-    queue: &VecDeque<QueueItem>,
-) -> QueueState {
-    QueueState {
-        version: queue_version,
-        updated_at_micros: queue_updated_at,
-        updated_by: local_peer_id.to_string(),
-        items: queue.iter().cloned().collect(),
-    }
-}
-
-fn should_apply_queue_state(local_version: u64, local_updated_at: i64, state: &QueueState) -> bool {
-    is_queue_state_newer(
-        state.version,
-        state.updated_at_micros,
-        local_version,
-        local_updated_at,
-    )
-}
-
-fn is_queue_state_newer(
-    candidate_version: u64,
-    candidate_updated_at: i64,
-    local_version: u64,
-    local_updated_at: i64,
-) -> bool {
-    candidate_updated_at > local_updated_at
-        || (candidate_updated_at == local_updated_at && candidate_version > local_version)
+fn build_queue_state(local_peer_id: PeerId, music: &MusicState) -> QueueState {
+    music.queue_state(local_peer_id)
 }
 
 async fn start_next_if_idle(
-    queue: &mut VecDeque<QueueItem>,
-    queue_version: &mut u64,
-    queue_updated_at: &mut i64,
-    pending_playback: &mut Option<PendingPlayback>,
-    playback_state: &mut Option<PlaybackState>,
-    playback_version: &mut u64,
+    music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -3304,27 +2438,18 @@ async fn start_next_if_idle(
     local_peer_id: PeerId,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
-    if pending_playback.is_some() || playback_has_track(playback_state.as_ref()) {
+    if !music.can_start_next() {
         return Ok(());
     }
 
-    let Some(item) = queue.pop_front() else {
+    let Some(item) = music.pop_next_queue_item() else {
         return Ok(());
     };
-    publish_queue_state(
-        swarm,
-        topic,
-        queue_version,
-        queue_updated_at,
-        local_peer_id,
-        queue,
-    )?;
-    send_queue_view(ui, *queue_version, *queue_updated_at, local_peer_id, queue).await;
+    publish_queue_state(swarm, topic, music, local_peer_id)?;
+    send_queue_view(ui, local_peer_id, music).await;
     begin_playback_prepare(
+        music,
         item,
-        pending_playback,
-        playback_state,
-        playback_version,
         audio_player,
         client,
         swarm,
@@ -3336,10 +2461,8 @@ async fn start_next_if_idle(
 }
 
 async fn begin_playback_prepare(
+    music: &mut MusicState,
     item: QueueItem,
-    pending_playback: &mut Option<PendingPlayback>,
-    playback_state: &mut Option<PlaybackState>,
-    playback_version: &mut u64,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -3349,59 +2472,47 @@ async fn begin_playback_prepare(
 ) -> Result<()> {
     let title = item.track.title.clone();
     let now = current_timestamp_micros();
-    if let Some(pending) = pending_playback.take() {
+    let expected_peers = expected_playback_peers(swarm, local_peer_id);
+    let prepare = music.begin_playback_prepare(
+        item,
+        expected_peers,
+        Instant::now() + MUSIC_PREPARE_TIMEOUT,
+        local_peer_id,
+        now,
+    );
+
+    if let Some(cancel) = prepare.canceled {
         publish_playback_cancel(
             swarm,
             topic,
-            &pending.state.session_id,
+            &cancel.session_id,
             local_peer_id,
-            "superseded by next queue item",
+            &cancel.reason,
         )?;
     }
-
-    *playback_version += 1;
-    let state = PlaybackState {
-        session_id: new_playback_session_id(local_peer_id, now, &item.track.track_id),
-        leader_peer_id: local_peer_id.to_string(),
-        track: Some(item.track),
-        track_requested_by: Some(item.requested_by),
-        state_version: *playback_version,
-        issued_at_micros: now,
-        playing: false,
-        position_ms: 0,
-        anchor_time_micros: now,
-        rate: 1.0,
-    };
-    let expected_peers = expected_playback_peers(swarm, local_peer_id);
-    *pending_playback = Some(PendingPlayback::new(
-        state.clone(),
-        expected_peers,
-        Instant::now() + MUSIC_PREPARE_TIMEOUT,
-    ));
-    *playback_state = Some(state.clone());
     if let Some(player) = audio_player.as_mut() {
         player.set_playing(false, now)?;
     }
-    send_playback_view(ui, &state).await;
-    if let Some(pending) = pending_playback.as_ref() {
-        publish_playback_prepare(swarm, topic, &state, &pending.expected_peers)?;
-    }
+    send_playback_view(ui, &prepare.state).await;
+    publish_playback_prepare(swarm, topic, &prepare.state, &prepare.expected_peers)?;
 
     send_status(ui, format!("preparing {title}")).await;
     send_status(ui, format!("downloading {title}")).await;
-    let Some(track) = state.track.as_ref() else {
+    let Some(track) = prepare.state.track.as_ref() else {
         return Ok(());
     };
     let audio = match bilibili::download_audio(client, track).await {
         Ok(audio) => audio,
         Err(err) => {
-            if let Some(pending) = pending_playback.take() {
+            if let Some(cancel) =
+                music.take_local_pending_cancel(local_peer_id, "local audio download failed")
+            {
                 publish_playback_cancel(
                     swarm,
                     topic,
-                    &pending.state.session_id,
+                    &cancel.session_id,
                     local_peer_id,
-                    "local audio download failed",
+                    &cancel.reason,
                 )?;
             }
             return Err(err);
@@ -3423,26 +2534,22 @@ async fn begin_playback_prepare(
     };
 
     if ready {
-        if let Some(pending) = pending_playback.as_mut() {
-            pending.mark_ready(local_peer_id.to_string());
-        }
+        let _ = music.mark_playback_ready(
+            &prepare.state.session_id,
+            &local_peer_id.to_string(),
+            local_peer_id,
+        );
         send_status(ui, "local audio ready".to_string()).await;
-        maybe_start_pending_playback(
-            pending_playback,
-            playback_state,
-            playback_version,
-            swarm,
-            topic,
-            ui,
-        )
-        .await?;
-    } else if let Some(pending) = pending_playback.take() {
+        maybe_start_pending_playback(music, swarm, topic, local_peer_id, ui).await?;
+    } else if let Some(cancel) =
+        music.take_local_pending_cancel(local_peer_id, "local audio failed to load")
+    {
         publish_playback_cancel(
             swarm,
             topic,
-            &pending.state.session_id,
+            &cancel.session_id,
             local_peer_id,
-            "local audio failed to load",
+            &cancel.reason,
         )?;
     }
 
@@ -3450,12 +2557,7 @@ async fn begin_playback_prepare(
 }
 
 async fn skip_current_track(
-    queue: &mut VecDeque<QueueItem>,
-    queue_version: &mut u64,
-    queue_updated_at: &mut i64,
-    pending_playback: &mut Option<PendingPlayback>,
-    playback_state: &mut Option<PlaybackState>,
-    playback_version: &mut u64,
+    music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -3464,9 +2566,7 @@ async fn skip_current_track(
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
     stop_current_playback(
-        pending_playback,
-        playback_state,
-        playback_version,
+        music,
         audio_player,
         swarm,
         topic,
@@ -3475,27 +2575,11 @@ async fn skip_current_track(
         ui,
     )
     .await?;
-    start_next_if_idle(
-        queue,
-        queue_version,
-        queue_updated_at,
-        pending_playback,
-        playback_state,
-        playback_version,
-        audio_player,
-        client,
-        swarm,
-        topic,
-        local_peer_id,
-        ui,
-    )
-    .await
+    start_next_if_idle(music, audio_player, client, swarm, topic, local_peer_id, ui).await
 }
 
 async fn stop_current_playback(
-    pending_playback: &mut Option<PendingPlayback>,
-    playback_state: &mut Option<PlaybackState>,
-    playback_version: &mut u64,
+    music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
@@ -3506,50 +2590,26 @@ async fn stop_current_playback(
     if let Some(player) = audio_player.as_mut() {
         player.stop();
     }
-    if let Some(pending) = pending_playback.take() {
+    if let Some(cancel) = music.take_local_pending_cancel(local_peer_id, reason) {
         publish_playback_cancel(
             swarm,
             topic,
-            &pending.state.session_id,
+            &cancel.session_id,
             local_peer_id,
-            reason,
+            &cancel.reason,
         )?;
     }
 
-    let now = current_timestamp_micros();
-    *playback_version += 1;
-    let state = PlaybackState {
-        session_id: new_playback_session_id(local_peer_id, now, "idle"),
-        leader_peer_id: local_peer_id.to_string(),
-        track: None,
-        track_requested_by: None,
-        state_version: *playback_version,
-        issued_at_micros: now,
-        playing: false,
-        position_ms: 0,
-        anchor_time_micros: now,
-        rate: 1.0,
-    };
-    *playback_state = Some(state.clone());
+    let state = music.stop_current_playback(local_peer_id, current_timestamp_micros());
     publish_playback_state(swarm, topic, &state)?;
     send_playback_view(ui, &state).await;
     send_status(ui, reason.to_string()).await;
     Ok(())
 }
 
-fn playback_has_track(state: Option<&PlaybackState>) -> bool {
-    state.and_then(|state| state.track.as_ref()).is_some()
-}
-
 async fn propose_or_execute_vote(
     action: VoteAction,
-    active_vote: &mut Option<ActiveVote>,
-    queue: &mut VecDeque<QueueItem>,
-    queue_version: &mut u64,
-    queue_updated_at: &mut i64,
-    pending_playback: &mut Option<PendingPlayback>,
-    playback_state: &mut Option<PlaybackState>,
-    playback_version: &mut u64,
+    music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -3557,7 +2617,7 @@ async fn propose_or_execute_vote(
     local_peer_id: PeerId,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
-    if active_vote.is_some() {
+    if music.active_vote.is_some() {
         send_status(ui, "another vote is already active".to_string()).await;
         return Ok(());
     }
@@ -3567,59 +2627,37 @@ async fn propose_or_execute_vote(
         vote_id: new_vote_id(local_peer_id, now),
         proposer: local_peer_id.to_string(),
         action,
-        queue_version: *queue_version,
-        playback_session_id: playback_state
-            .as_ref()
-            .map(|state| state.session_id.clone()),
+        queue_version: music.queue_version,
+        playback_session_id: music.playback_state().map(|state| state.session_id.clone()),
         created_at_micros: now,
     };
 
-    let mut vote = ActiveVote::new(proposal.clone(), Instant::now() + VOTE_TIMEOUT);
-    vote.vote(local_peer_id.to_string(), true);
+    music.start_vote(proposal.clone(), Instant::now() + VOTE_TIMEOUT);
     publish_vote_proposal(swarm, topic, &proposal, local_peer_id)?;
     publish_vote_ballot(swarm, topic, &proposal.vote_id, local_peer_id, true)?;
-    let approval_count = vote.approval_count();
+    let approval_count = music
+        .active_vote
+        .as_ref()
+        .map_or(0, |vote| vote.approval_count());
     let threshold = majority_threshold(swarm.connected_peers().count() + 1);
-    *active_vote = Some(vote);
-    send_vote_view(ui, active_vote.as_ref(), queue, threshold).await;
+    send_vote_view(ui, music, threshold).await;
     send_status(
         ui,
         format!(
             "started vote: {} ({}/{})",
-            describe_vote_action(&proposal.action, queue),
+            describe_vote_action(&proposal.action, &music.queue),
             approval_count,
             threshold
         ),
     )
     .await;
 
-    resolve_active_vote(
-        active_vote,
-        queue,
-        queue_version,
-        queue_updated_at,
-        pending_playback,
-        playback_state,
-        playback_version,
-        audio_player,
-        client,
-        swarm,
-        topic,
-        local_peer_id,
-        ui,
-    )
-    .await
+    resolve_active_vote(music, audio_player, client, swarm, topic, local_peer_id, ui).await
 }
 
 async fn cast_vote(
     approve: bool,
-    active_vote: &mut Option<ActiveVote>,
-    queue: &mut VecDeque<QueueItem>,
-    queue_version: &mut u64,
-    queue_updated_at: &mut i64,
-    pending_playback: &mut Option<PendingPlayback>,
-    playback_state: &mut Option<PlaybackState>,
-    playback_version: &mut u64,
+    music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -3627,56 +2665,29 @@ async fn cast_vote(
     local_peer_id: PeerId,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
-    let Some(vote) = active_vote.as_mut() else {
+    let Some(vote_id) = music.cast_vote(local_peer_id.to_string(), approve) else {
         send_status(ui, "no active vote".to_string()).await;
         return Ok(());
     };
 
-    vote.vote(local_peer_id.to_string(), approve);
-    publish_vote_ballot(swarm, topic, &vote.proposal.vote_id, local_peer_id, approve)?;
+    publish_vote_ballot(swarm, topic, &vote_id, local_peer_id, approve)?;
     send_status(
         ui,
-        format!(
-            "voted {} on {}",
-            if approve { "yes" } else { "no" },
-            vote.proposal.vote_id
-        ),
+        format!("voted {} on {vote_id}", if approve { "yes" } else { "no" }),
     )
     .await;
     send_vote_view(
         ui,
-        active_vote.as_ref(),
-        queue,
+        music,
         majority_threshold(swarm.connected_peers().count() + 1),
     )
     .await;
 
-    resolve_active_vote(
-        active_vote,
-        queue,
-        queue_version,
-        queue_updated_at,
-        pending_playback,
-        playback_state,
-        playback_version,
-        audio_player,
-        client,
-        swarm,
-        topic,
-        local_peer_id,
-        ui,
-    )
-    .await
+    resolve_active_vote(music, audio_player, client, swarm, topic, local_peer_id, ui).await
 }
 
 async fn resolve_active_vote(
-    active_vote: &mut Option<ActiveVote>,
-    queue: &mut VecDeque<QueueItem>,
-    queue_version: &mut u64,
-    queue_updated_at: &mut i64,
-    pending_playback: &mut Option<PendingPlayback>,
-    playback_state: &mut Option<PlaybackState>,
-    playback_version: &mut u64,
+    music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -3684,43 +2695,30 @@ async fn resolve_active_vote(
     local_peer_id: PeerId,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
-    let Some(vote) = active_vote.as_ref() else {
+    let threshold = majority_threshold(swarm.connected_peers().count() + 1);
+    let Some(proposal) = music.resolve_vote(threshold) else {
         return Ok(());
     };
 
-    let threshold = majority_threshold(swarm.connected_peers().count() + 1);
-    if vote.approval_count() < threshold {
-        return Ok(());
-    }
-
-    let vote = active_vote
-        .take()
-        .ok_or_else(|| anyhow!("active vote disappeared"))?;
-    send_vote_view(ui, None, queue, threshold).await;
+    send_vote_view(ui, music, threshold).await;
     send_status(
         ui,
         format!(
             "vote passed: {}",
-            describe_vote_action(&vote.proposal.action, queue)
+            describe_vote_action(&proposal.action, &music.queue)
         ),
     )
     .await;
 
-    if let Some(reason) = stale_vote_reason(&vote.proposal, *queue_version, playback_state.as_ref())
-    {
+    if let Some(reason) = music.stale_vote_reason(&proposal) {
         send_status(ui, format!("vote discarded: {reason}")).await;
         return Ok(());
     }
 
-    if should_execute_vote_locally(&vote.proposal, playback_state.as_ref(), local_peer_id) {
+    if music.should_execute_vote_locally(&proposal, local_peer_id) {
         execute_vote_action(
-            vote.proposal.action,
-            queue,
-            queue_version,
-            queue_updated_at,
-            pending_playback,
-            playback_state,
-            playback_version,
+            proposal.action,
+            music,
             audio_player,
             client,
             swarm,
@@ -3734,47 +2732,9 @@ async fn resolve_active_vote(
     Ok(())
 }
 
-fn stale_vote_reason(
-    proposal: &VoteProposal,
-    queue_version: u64,
-    playback_state: Option<&PlaybackState>,
-) -> Option<&'static str> {
-    match &proposal.action {
-        VoteAction::Remove { .. } | VoteAction::Move { .. } => {
-            (proposal.queue_version != queue_version).then_some("queue changed during vote")
-        }
-        VoteAction::Pause | VoteAction::Resume | VoteAction::Skip | VoteAction::Seek { .. } => {
-            let current_session = playback_state
-                .and_then(|state| state.track.as_ref().map(|_| state.session_id.as_str()));
-            (proposal.playback_session_id.as_deref() != current_session)
-                .then_some("playback changed during vote")
-        }
-    }
-}
-
-fn should_execute_vote_locally(
-    proposal: &VoteProposal,
-    playback_state: Option<&PlaybackState>,
-    local_peer_id: PeerId,
-) -> bool {
-    match &proposal.action {
-        VoteAction::Remove { .. } | VoteAction::Move { .. } => {
-            proposal.proposer == local_peer_id.to_string()
-        }
-        VoteAction::Pause | VoteAction::Resume | VoteAction::Skip | VoteAction::Seek { .. } => {
-            playback_state.is_some_and(|state| can_control_playback(state, local_peer_id))
-        }
-    }
-}
-
 async fn execute_vote_action(
     action: VoteAction,
-    queue: &mut VecDeque<QueueItem>,
-    queue_version: &mut u64,
-    queue_updated_at: &mut i64,
-    pending_playback: &mut Option<PendingPlayback>,
-    playback_state: &mut Option<PlaybackState>,
-    playback_version: &mut u64,
+    music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -3784,112 +2744,70 @@ async fn execute_vote_action(
 ) -> Result<()> {
     match action {
         VoteAction::Pause => {
-            if let Some(state) = playback_state.as_mut() {
-                let now = current_timestamp_micros();
-                let position_ms = playback_position_ms(state, now);
-                *playback_version += 1;
-                state.state_version = *playback_version;
-                state.issued_at_micros = now;
-                state.playing = false;
-                state.position_ms = position_ms;
-                state.anchor_time_micros = now;
-                state.leader_peer_id = local_peer_id.to_string();
+            let now = current_timestamp_micros();
+            if let Some(state) = music.pause_playback(local_peer_id, now) {
                 if let Some(player) = audio_player.as_mut() {
                     player.set_playing(false, now)?;
                 }
-                publish_playback_state(swarm, topic, state)?;
-                send_playback_view(ui, state).await;
+                publish_playback_state(swarm, topic, &state)?;
+                send_playback_view(ui, &state).await;
             }
         }
         VoteAction::Resume => {
-            if let Some(state) = playback_state.as_mut() {
-                let now = current_timestamp_micros();
-                let position_ms = playback_position_ms(state, now);
-                let playing = can_play_at_position(state, position_ms);
-                *playback_version += 1;
-                state.state_version = *playback_version;
-                state.issued_at_micros = now;
-                state.playing = playing;
-                state.position_ms = position_ms;
-                state.anchor_time_micros = now;
-                state.leader_peer_id = local_peer_id.to_string();
+            let now = current_timestamp_micros();
+            if let Some(state) = music.resume_playback(local_peer_id, now) {
                 if let Some(player) = audio_player.as_mut() {
-                    player.set_playing(playing, now)?;
+                    player.set_playing(state.playing, now)?;
                 }
-                publish_playback_state(swarm, topic, state)?;
-                send_playback_view(ui, state).await;
+                publish_playback_state(swarm, topic, &state)?;
+                send_playback_view(ui, &state).await;
             }
         }
         VoteAction::Skip => {
-            skip_current_track(
-                queue,
-                queue_version,
-                queue_updated_at,
-                pending_playback,
-                playback_state,
-                playback_version,
-                audio_player,
-                client,
-                swarm,
-                topic,
-                local_peer_id,
-                ui,
-            )
-            .await?;
+            skip_current_track(music, audio_player, client, swarm, topic, local_peer_id, ui)
+                .await?;
         }
         VoteAction::Seek { position_ms } => {
-            if let Some(state) = playback_state.as_mut() {
-                let now = current_timestamp_micros();
-                let position_ms = clamp_playback_position_ms(state, position_ms);
-                let playing = state.playing && can_play_at_position(state, position_ms);
-                *playback_version += 1;
-                state.state_version = *playback_version;
-                state.issued_at_micros = now;
-                state.playing = playing;
-                state.position_ms = position_ms;
-                state.anchor_time_micros = now;
-                state.leader_peer_id = local_peer_id.to_string();
+            let now = current_timestamp_micros();
+            if let Some(state) = music.seek_playback(local_peer_id, position_ms, now) {
                 if let Some(player) = audio_player.as_mut() {
-                    player.seek(position_ms, playing, now)?;
+                    player.seek(state.position_ms, state.playing, now)?;
                 }
-                publish_playback_state(swarm, topic, state)?;
-                send_playback_view(ui, state).await;
+                publish_playback_state(swarm, topic, &state)?;
+                send_playback_view(ui, &state).await;
             }
         }
         VoteAction::Remove { item_id } => {
-            if let Some(index) = queue.iter().position(|item| item.item_id == item_id) {
-                let removed = queue.remove(index);
-                publish_queue_state(
-                    swarm,
-                    topic,
-                    queue_version,
-                    queue_updated_at,
-                    local_peer_id,
-                    queue,
-                )?;
-                send_queue_view(ui, *queue_version, *queue_updated_at, local_peer_id, queue).await;
+            if let Some(index) = music.queue.iter().position(|item| item.item_id == item_id) {
+                let removed = music.queue.remove(index);
+                publish_queue_state(swarm, topic, music, local_peer_id)?;
+                send_queue_view(ui, local_peer_id, music).await;
                 if let Some(item) = removed {
                     send_status(ui, format!("removed {}", item.track.title)).await;
                 }
+            } else {
+                send_status(
+                    ui,
+                    "vote discarded: queue item is no longer available".to_string(),
+                )
+                .await;
             }
         }
         VoteAction::Move { item_id, to_index } => {
-            if let Some(index) = queue.iter().position(|item| item.item_id == item_id) {
-                if let Some(item) = queue.remove(index) {
-                    let to_index = to_index.min(queue.len());
-                    queue.insert(to_index, item);
-                    publish_queue_state(
-                        swarm,
-                        topic,
-                        queue_version,
-                        queue_updated_at,
-                        local_peer_id,
-                        queue,
-                    )?;
-                    send_queue_view(ui, *queue_version, *queue_updated_at, local_peer_id, queue)
-                        .await;
+            if let Some(index) = music.queue.iter().position(|item| item.item_id == item_id) {
+                if let Some(item) = music.queue.remove(index) {
+                    let to_index = to_index.min(music.queue.len());
+                    music.queue.insert(to_index, item);
+                    publish_queue_state(swarm, topic, music, local_peer_id)?;
+                    send_queue_view(ui, local_peer_id, music).await;
                     send_status(ui, format!("moved queue item to #{}", to_index + 1)).await;
                 }
+            } else {
+                send_status(
+                    ui,
+                    "vote discarded: queue item is no longer available".to_string(),
+                )
+                .await;
             }
         }
     }
@@ -3932,21 +2850,6 @@ fn publish_vote_ballot(
     )
 }
 
-fn majority_threshold(total_peers: usize) -> usize {
-    total_peers / 2 + 1
-}
-
-fn can_control_playback(state: &PlaybackState, local_peer_id: PeerId) -> bool {
-    state
-        .track_requested_by
-        .as_ref()
-        .is_some_and(|requester| requester == &local_peer_id.to_string())
-}
-
-fn queue_item_at(queue: &VecDeque<QueueItem>, index: usize) -> Option<&QueueItem> {
-    index.checked_sub(1).and_then(|index| queue.get(index))
-}
-
 async fn send_queue_status(
     ui: &mpsc::Sender<UiEvent>,
     playback_state: Option<&PlaybackState>,
@@ -3977,27 +2880,6 @@ async fn send_queue_status(
     }
     if queue.len() > 3 {
         send_status(ui, format!("... and {} more", queue.len() - 3)).await;
-    }
-}
-
-fn describe_vote_action(action: &VoteAction, queue: &VecDeque<QueueItem>) -> String {
-    match action {
-        VoteAction::Pause => "pause playback".to_string(),
-        VoteAction::Resume => "resume playback".to_string(),
-        VoteAction::Skip => "skip current track".to_string(),
-        VoteAction::Seek { position_ms } => {
-            format!("seek to {}", format_duration_ms(*position_ms))
-        }
-        VoteAction::Remove { item_id } => queue
-            .iter()
-            .position(|item| item.item_id == *item_id)
-            .map(|index| format!("remove queue item #{}", index + 1))
-            .unwrap_or_else(|| "remove queue item".to_string()),
-        VoteAction::Move { item_id, to_index } => queue
-            .iter()
-            .position(|item| item.item_id == *item_id)
-            .map(|index| format!("move queue item #{} to #{}", index + 1, to_index + 1))
-            .unwrap_or_else(|| format!("move queue item to #{}", to_index + 1)),
     }
 }
 
@@ -4084,72 +2966,50 @@ fn publish_playback_cancel(
 }
 
 fn cancel_local_pending_playback(
-    pending_playback: &mut Option<PendingPlayback>,
+    music: &mut MusicState,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     local_peer_id: PeerId,
     reason: &str,
 ) {
-    if let Some(pending) = pending_playback.take() {
+    if let Some(cancel) = music.take_local_pending_cancel(local_peer_id, reason) {
         let _ = publish_playback_cancel(
             swarm,
             topic,
-            &pending.state.session_id,
+            &cancel.session_id,
             local_peer_id,
-            reason,
+            &cancel.reason,
         );
     }
 }
 
 async fn maybe_start_pending_playback(
-    pending_playback: &mut Option<PendingPlayback>,
-    playback_state: &mut Option<PlaybackState>,
-    playback_version: &mut u64,
+    music: &mut MusicState,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
+    local_peer_id: PeerId,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
-    let Some(pending) = pending_playback.as_ref() else {
-        return Ok(());
-    };
-
-    let timed_out = Instant::now() >= pending.deadline;
-    if !pending.is_ready() && !timed_out {
-        return Ok(());
+    if let Some(start) = music.maybe_start_pending_playback(
+        local_peer_id,
+        Instant::now(),
+        current_timestamp_micros(),
+        MUSIC_START_DELAY,
+    ) {
+        publish_playback_state(swarm, topic, &start.state)?;
+        send_playback_view(ui, &start.state).await;
+        send_status(
+            ui,
+            format!(
+                "starting playback in {:.1}s ({}, {}/{})",
+                MUSIC_START_DELAY.as_secs_f32(),
+                start.reason,
+                start.ready,
+                start.expected
+            ),
+        )
+        .await;
     }
-
-    let pending = pending_playback
-        .take()
-        .ok_or_else(|| anyhow!("pending playback disappeared"))?;
-    let now = current_timestamp_micros();
-    *playback_version += 1;
-
-    let mut state = pending.state.clone();
-    state.state_version = *playback_version;
-    state.issued_at_micros = now;
-    state.playing = true;
-    state.position_ms = 0;
-    state.anchor_time_micros = now + duration_micros(MUSIC_START_DELAY);
-
-    *playback_state = Some(state.clone());
-    publish_playback_state(swarm, topic, &state)?;
-    send_playback_view(ui, &state).await;
-
-    let reason = if pending.is_ready() {
-        "all peers ready"
-    } else {
-        "ready wait timed out"
-    };
-    send_status(
-        ui,
-        format!(
-            "starting playback in {:.1}s ({reason}, {}/{})",
-            MUSIC_START_DELAY.as_secs_f32(),
-            pending.ready_count(),
-            pending.expected_count()
-        ),
-    )
-    .await;
 
     Ok(())
 }
@@ -4157,17 +3017,21 @@ async fn maybe_start_pending_playback(
 async fn apply_playback_prepare(
     client: &reqwest::Client,
     audio_player: &mut Option<player::AudioPlayer>,
-    current_state: &mut Option<PlaybackState>,
+    music: &mut MusicState,
     state: &PlaybackState,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<bool> {
     let now = current_timestamp_micros();
+    let invalidated_vote = music.set_remote_playback_prepare(state.clone());
     if let Some(player) = audio_player.as_mut() {
         player.set_playing(false, now)?;
     }
 
-    *current_state = Some(state.clone());
     send_playback_view(ui, state).await;
+    if let Some(invalidated_vote) = invalidated_vote {
+        let _ = ui.send(UiEvent::Vote(None)).await;
+        send_status(ui, invalidated_vote.reason.to_string()).await;
+    }
 
     let Some(track) = &state.track else {
         return Ok(true);
@@ -4198,22 +3062,28 @@ async fn apply_playback_prepare(
 
 async fn apply_playback_cancel(
     audio_player: &mut Option<player::AudioPlayer>,
-    playback_state: &mut Option<PlaybackState>,
+    music: &mut MusicState,
     session_id: &str,
     reason: &str,
     ui: &mpsc::Sender<UiEvent>,
 ) {
-    if playback_state
-        .as_ref()
-        .is_some_and(|state| state.session_id == session_id)
-    {
-        if let Some(player) = audio_player.as_mut() {
-            player.stop();
-        }
-        *playback_state = None;
-        let _ = ui.send(UiEvent::Playback(None)).await;
-        send_status(ui, format!("playback canceled: {reason}")).await;
+    let matches_session = music
+        .playback_state()
+        .is_some_and(|state| state.session_id == session_id);
+    if !matches_session {
+        return;
     }
+
+    if let Some(player) = audio_player.as_mut() {
+        player.stop();
+    }
+    let invalidated_vote = music.cancel_playback(session_id);
+    let _ = ui.send(UiEvent::Playback(None)).await;
+    if let Some(invalidated_vote) = invalidated_vote {
+        let _ = ui.send(UiEvent::Vote(None)).await;
+        send_status(ui, invalidated_vote.reason.to_string()).await;
+    }
+    send_status(ui, format!("playback canceled: {reason}")).await;
 }
 
 fn sync_loaded_player_to_state(
@@ -4257,50 +3127,10 @@ fn expected_playback_peers(
     peers
 }
 
-fn new_playback_session_id(local_peer_id: PeerId, issued_at_micros: i64, track_id: &str) -> String {
-    format!("{local_peer_id}:{issued_at_micros}:{track_id}")
-}
-
-fn should_apply_playback_state(current: Option<&PlaybackState>, next: &PlaybackState) -> bool {
-    let Some(current) = current else {
-        return true;
-    };
-
-    let current_key = playback_order_key(current);
-    let next_key = playback_order_key(next);
-    if next_key != current_key {
-        return next_key > current_key;
-    }
-
-    current.track.as_ref().map(|track| &track.track_id)
-        == next.track.as_ref().map(|track| &track.track_id)
-        && current.leader_peer_id == next.leader_peer_id
-        && (current.anchor_time_micros < next.anchor_time_micros
-            || current.position_ms != next.position_ms
-            || current.playing != next.playing)
-}
-
-fn normalize_remote_playback_state(
-    state: &PlaybackState,
-    received_at_micros: i64,
-) -> PlaybackState {
-    let mut normalized = state.clone();
-    let start_delay_micros = if state.playing && state.anchor_time_micros > state.issued_at_micros {
-        state
-            .anchor_time_micros
-            .saturating_sub(state.issued_at_micros)
-    } else {
-        0
-    };
-
-    normalized.anchor_time_micros = received_at_micros.saturating_add(start_delay_micros);
-    normalized
-}
-
 async fn apply_remote_playback_state(
     client: &reqwest::Client,
     audio_player: &mut Option<player::AudioPlayer>,
-    current_state: &mut Option<PlaybackState>,
+    music: &mut MusicState,
     state: &PlaybackState,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
@@ -4312,8 +3142,12 @@ async fn apply_remote_playback_state(
         if let Some(player) = audio_player.as_mut() {
             player.stop();
         }
-        *current_state = Some(state.clone());
+        let invalidated_vote = music.set_playback_state(state.clone());
         send_playback_view(ui, state).await;
+        if let Some(invalidated_vote) = invalidated_vote {
+            let _ = ui.send(UiEvent::Vote(None)).await;
+            send_status(ui, invalidated_vote.reason.to_string()).await;
+        }
         return Ok(());
     }
 
@@ -4341,51 +3175,13 @@ async fn apply_remote_playback_state(
         }
     }
 
-    *current_state = Some(state.clone());
+    let invalidated_vote = music.set_playback_state(state.clone());
     send_playback_view(ui, state).await;
+    if let Some(invalidated_vote) = invalidated_vote {
+        let _ = ui.send(UiEvent::Vote(None)).await;
+        send_status(ui, invalidated_vote.reason.to_string()).await;
+    }
     Ok(())
-}
-
-fn playback_position_ms(state: &PlaybackState, now_micros: i64) -> u64 {
-    let position_ms = if !state.playing {
-        state.position_ms
-    } else {
-        let elapsed_micros = now_micros.saturating_sub(state.anchor_time_micros).max(0) as f64;
-        let elapsed_ms = (elapsed_micros / 1000.0 * state.rate.max(0.0) as f64) as u64;
-        state.position_ms.saturating_add(elapsed_ms)
-    };
-
-    clamp_playback_position_ms(state, position_ms)
-}
-
-fn playback_order_key(state: &PlaybackState) -> (i64, u64, &str) {
-    (
-        state.issued_at_micros,
-        state.state_version,
-        state.leader_peer_id.as_str(),
-    )
-}
-
-fn playback_duration_ms(state: &PlaybackState) -> Option<u64> {
-    state.track.as_ref().map(|track| track.duration_ms)
-}
-
-fn clamp_playback_position_ms(state: &PlaybackState, position_ms: u64) -> u64 {
-    playback_duration_ms(state).map_or(position_ms, |duration| position_ms.min(duration))
-}
-
-fn can_play_at_position(state: &PlaybackState, position_ms: u64) -> bool {
-    playback_duration_ms(state).is_none_or(|duration| position_ms < duration)
-}
-
-fn playback_should_be_audible(state: &PlaybackState, now_micros: i64) -> bool {
-    state.playing
-        && now_micros >= state.anchor_time_micros
-        && can_play_at_position(state, playback_position_ms(state, now_micros))
-}
-
-fn duration_micros(duration: Duration) -> i64 {
-    i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)
 }
 
 async fn send_playback_view(ui: &mpsc::Sender<UiEvent>, state: &PlaybackState) {
@@ -4439,23 +3235,166 @@ fn new_vote_id(peer_id: PeerId, created_at_micros: i64) -> String {
     format!("v-{peer_id}-{created_at_micros}-{:x}", hasher.finish())
 }
 
-fn prioritize_multiaddrs(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
-    let mut addrs = addrs;
-    addrs.sort_by(|a, b| ipv6_preference_score(b).cmp(&ipv6_preference_score(a)));
-    addrs
-}
-
-fn ipv6_preference_score(addr: &Multiaddr) -> u8 {
-    let text = addr.to_string();
-    if text.contains("/ip6/") || text.contains("/dns6/") {
-        2
-    } else if text.contains("/ip4/") || text.contains("/dns4/") {
-        1
-    } else {
-        0
-    }
-}
-
 async fn send_status(ui: &mpsc::Sender<UiEvent>, status: String) {
     let _ = ui.send(UiEvent::Status(status)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use libp2p::identity;
+
+    use crate::connection_state::{
+        DIRECT_PROMOTION_FAILURE_DEDUP_WINDOW, DIRECT_PROMOTION_MAX_FAILURES,
+        DIRECT_PROMOTION_MEDIUM_RETRY_FAILURES, DIRECT_PROMOTION_MEDIUM_RETRY_INTERVAL,
+        DIRECT_PROMOTION_RETRY_INTERVAL, DIRECT_PROMOTION_SLOW_RETRY_FAILURES,
+        DIRECT_PROMOTION_SLOW_RETRY_INTERVAL, DirectPromotionBackoff,
+        DirectPromotionFailureOutcome, normalize_direct_peer_address,
+    };
+
+    use super::*;
+
+    fn peer_id() -> PeerId {
+        identity::Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    fn record(id: impl Into<String>, sent_at: i64) -> ChatRecord {
+        ChatRecord {
+            id: id.into(),
+            peer_id: "peer".to_string(),
+            joined_at: Some(1_700_000_000_000_000),
+            author: "alice".to_string(),
+            text: "hello".to_string(),
+            sent_at,
+        }
+    }
+
+    #[test]
+    fn insert_record_dedups_and_orders_by_normalized_timestamp() {
+        let mut history = Vec::new();
+        let mut seen_messages = HashSet::new();
+
+        assert!(insert_record(
+            &mut history,
+            &mut seen_messages,
+            record("later-seconds", 1_700_000_001)
+        ));
+        assert!(insert_record(
+            &mut history,
+            &mut seen_messages,
+            record("older-micros", 1_700_000_000_250_000)
+        ));
+        assert!(insert_record(
+            &mut history,
+            &mut seen_messages,
+            record("middle-millis", 1_700_000_000_500)
+        ));
+        assert!(!insert_record(
+            &mut history,
+            &mut seen_messages,
+            record("middle-millis", 1_700_000_000_500)
+        ));
+
+        let ids = history
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["older-micros", "middle-millis", "later-seconds"]);
+        assert_eq!(seen_messages.len(), 3);
+    }
+
+    #[test]
+    fn insert_record_trims_old_history_and_seen_messages() {
+        let mut history = Vec::new();
+        let mut seen_messages = HashSet::new();
+        let base = 1_700_000_000_000_000_i64;
+
+        for index in 0..MAX_MESSAGES + 2 {
+            assert!(insert_record(
+                &mut history,
+                &mut seen_messages,
+                record(format!("id-{index}"), base + index as i64)
+            ));
+        }
+
+        assert_eq!(history.len(), MAX_MESSAGES);
+        assert_eq!(
+            history.first().map(|record| record.id.as_str()),
+            Some("id-2")
+        );
+        assert!(!seen_messages.contains("id-0"));
+        assert!(!seen_messages.contains("id-1"));
+        assert!(seen_messages.contains(&format!("id-{}", MAX_MESSAGES + 1)));
+    }
+
+    #[test]
+    fn peer_address_normalization_appends_or_rejects_peer_ids() {
+        let peer = peer_id();
+        let other_peer = peer_id();
+
+        let base: Multiaddr = "/ip4/192.0.2.10/tcp/4001".parse().unwrap();
+        let normalized = normalize_peer_address(peer, base.clone()).unwrap();
+        assert_eq!(peer_id_from_multiaddr(&normalized), Some(peer));
+
+        let wrong_peer: Multiaddr = format!("/ip4/192.0.2.10/tcp/4001/p2p/{other_peer}")
+            .parse()
+            .unwrap();
+        assert!(normalize_peer_address(peer, wrong_peer.clone()).is_none());
+
+        let unspecified: Multiaddr = "/ip4/0.0.0.0/tcp/4001".parse().unwrap();
+        assert!(normalize_peer_address(peer, unspecified).is_none());
+
+        let direct = normalize_direct_peer_address(peer, base).unwrap();
+        assert_eq!(peer_id_from_multiaddr(&direct), Some(peer));
+        assert!(normalize_direct_peer_address(peer, wrong_peer).is_none());
+
+        let relay_addr: Multiaddr =
+            format!("/ip4/192.0.2.20/tcp/4001/p2p/{other_peer}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        assert!(normalize_direct_peer_address(peer, relay_addr).is_none());
+    }
+
+    #[test]
+    fn direct_promotion_backoff_tiers_and_suspends() {
+        let mut backoff = DirectPromotionBackoff::default();
+        let mut now = Instant::now();
+
+        assert!(matches!(
+            backoff.mark_failure(now),
+            DirectPromotionFailureOutcome::Counted {
+                failures: 1,
+                retry_after: Some(DIRECT_PROMOTION_RETRY_INTERVAL),
+            }
+        ));
+        assert!(matches!(
+            backoff.mark_failure(now + Duration::from_secs(1)),
+            DirectPromotionFailureOutcome::Duplicate
+        ));
+
+        for expected_failures in 2..=DIRECT_PROMOTION_MAX_FAILURES {
+            now += DIRECT_PROMOTION_FAILURE_DEDUP_WINDOW + Duration::from_secs(1);
+            let outcome = backoff.mark_failure(now);
+            let expected_retry_after = match expected_failures {
+                DIRECT_PROMOTION_MAX_FAILURES => None,
+                0..DIRECT_PROMOTION_MEDIUM_RETRY_FAILURES => Some(DIRECT_PROMOTION_RETRY_INTERVAL),
+                DIRECT_PROMOTION_MEDIUM_RETRY_FAILURES..DIRECT_PROMOTION_SLOW_RETRY_FAILURES => {
+                    Some(DIRECT_PROMOTION_MEDIUM_RETRY_INTERVAL)
+                }
+                _ => Some(DIRECT_PROMOTION_SLOW_RETRY_INTERVAL),
+            };
+
+            assert!(matches!(
+                outcome,
+                DirectPromotionFailureOutcome::Counted {
+                    failures,
+                    retry_after,
+                } if failures == expected_failures && retry_after == expected_retry_after
+            ));
+        }
+
+        assert_eq!(backoff.failures, DIRECT_PROMOTION_MAX_FAILURES);
+        assert!(!backoff.should_attempt(now));
+    }
 }

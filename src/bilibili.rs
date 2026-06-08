@@ -279,3 +279,56 @@ fn signed_query<const N: usize>(params: [(&str, String); N], mixin_key: &str) ->
     let w_rid = format!("{:x}", md5::compute(format!("{query}{mixin_key}")));
     format!("{query}&w_rid={w_rid}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_stem_extracts_last_path_stem() {
+        assert_eq!(
+            url_stem("https://i0.hdslb.com/bfs/wbi/abc123.png").unwrap(),
+            "abc123"
+        );
+        assert_eq!(url_stem("plainfile").unwrap(), "plainfile");
+    }
+
+    #[test]
+    fn mixin_key_is_deterministic_and_rejects_short_keys() {
+        let info = BilibiliWbiInfo {
+            img_url: "https://example.test/abcdefghijklmnopqrstuvwxyzABCDEF.png".to_string(),
+            sub_url: "https://example.test/GHIJKLMNOPQRSTUVWXYZ0123456789.png".to_string(),
+        };
+
+        assert_eq!(
+            mixin_key(&info).unwrap(),
+            "UVsc1ixGpYkF6dTJBRfXHjQtDCoNmMPn"
+        );
+
+        let short = BilibiliWbiInfo {
+            img_url: "https://example.test/a.png".to_string(),
+            sub_url: "https://example.test/b.png".to_string(),
+        };
+        assert!(mixin_key(&short).is_err());
+    }
+
+    #[test]
+    fn signed_query_sorts_and_percent_encodes_params() {
+        let mixin = "0123456789abcdef0123456789abcdef";
+        let query = signed_query(
+            [("b", "two words".to_string()), ("a", "x/y".to_string())],
+            mixin,
+        );
+        let expected_prefix = "a=x%2Fy&b=two%20words";
+        let expected_rid = format!("{:x}", md5::compute(format!("{expected_prefix}{mixin}")));
+
+        assert_eq!(query, format!("{expected_prefix}&w_rid={expected_rid}"));
+        assert_eq!(
+            query,
+            signed_query(
+                [("a", "x/y".to_string()), ("b", "two words".to_string()),],
+                mixin,
+            )
+        );
+    }
+}
