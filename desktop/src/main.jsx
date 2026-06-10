@@ -49,6 +49,7 @@ const initialRoom = {
   queue: null,
   vote: null,
   peers: [],
+  peerNames: [],
 };
 
 function App() {
@@ -285,8 +286,8 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
     ? Math.min(100, Math.max(0, (playback.position_ms / Math.max(playback.duration_ms || 0, 1)) * 100))
     : 0;
   const peerNames = useMemo(
-    () => buildPeerNames(room.messages, room.localPeerId, config.name),
-    [room.messages, room.localPeerId, config.name],
+    () => buildPeerNames(room.messages, room.localPeerId, config.name, room.peerNames),
+    [room.messages, room.localPeerId, config.name, room.peerNames],
   );
   const displayName = (peerId, explicitName) => peerDisplayName(peerId, peerNames, explicitName);
 
@@ -363,17 +364,23 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
           <MessageList messages={room.messages} />
 
           <form className="composer" onSubmit={sendChat}>
-            <input
+            <textarea
               value={chatText}
               autoComplete="off"
               placeholder="Message the room"
+              rows="1"
               onChange={(event) => setChatText(event.target.value)}
               onCompositionStart={() => setChatComposing(true)}
               onCompositionEnd={() => setChatComposing(false)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && (chatComposing || event.nativeEvent?.isComposing)) {
+                if (event.key !== "Enter") return;
+                if (event.shiftKey) return;
+                if (chatComposing || event.nativeEvent?.isComposing) {
                   event.preventDefault();
+                  return;
                 }
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
               }}
             />
             <button className="btn primary" type="submit">
@@ -519,7 +526,9 @@ function PlayerDock({
     <section className="player-dock" aria-label="Playback controls">
       <div className="player-track">
         <p className="overline">Now Playing</p>
-        <h2>{playback?.title ?? "Idle"}</h2>
+        <h2 className={playback?.title && playback.title.length > 28 ? "track-title scrolling" : "track-title"}>
+          <span>{playback?.title ?? "Idle"}</span>
+        </h2>
         <div className="playback-details">
           <span className={`pill ${playback?.playing ? "playing" : playback ? "paused" : "neutral"}`}>
             {playback ? (playback.playing ? "playing" : "paused") : "standing by"}
@@ -901,9 +910,14 @@ function ConfirmSeekModal({ seek, onCancel, onConfirm }) {
 
 function VoteModal({ vote, onVote, displayName }) {
   const [busy, setBusy] = useState(false);
-  const approvalWidth = Math.min(100, (vote.approvals / Math.max(vote.threshold, 1)) * 100);
+  const eligible = Math.max(vote.eligible_peers ?? vote.threshold ?? 1, 1);
+  const approvalWidth = Math.min(100, (vote.approvals / eligible) * 100);
+  const rejectionWidth = Math.min(100, (vote.rejections / eligible) * 100);
+  const localVote = vote.local_vote;
+  const hasVoted = localVote === true || localVote === false;
 
   async function cast(approve) {
+    if (hasVoted) return;
     setBusy(true);
     await onVote(approve);
     setBusy(false);
@@ -921,15 +935,23 @@ function VoteModal({ vote, onVote, displayName }) {
           <strong>{vote.approvals}/{vote.threshold}</strong>
         </div>
         <div className="vote-meter" aria-hidden="true">
-          <span style={{ width: `${approvalWidth}%` }}></span>
+          <span className="vote-meter-yes" style={{ width: `${approvalWidth}%` }}></span>
+          <span className="vote-meter-no" style={{ width: `${rejectionWidth}%` }}></span>
         </div>
-        <p className="modal-meta">{vote.rejections} rejected</p>
+        <div className="vote-counts">
+          <span className="vote-count yes">{vote.approvals} yes</span>
+          <span className="vote-count no">{vote.rejections} no</span>
+          <span className="vote-count pending">{vote.pending ?? 0} pending</span>
+        </div>
+        {hasVoted && (
+          <p className="modal-meta">you voted {localVote ? "yes" : "no"}</p>
+        )}
         <div className="modal-actions">
-          <button className="btn approve" type="button" onClick={() => cast(true)} disabled={busy}>
+          <button className="btn approve" type="button" onClick={() => cast(true)} disabled={busy || hasVoted}>
             <Check size={17} aria-hidden="true" />
             Yes
           </button>
-          <button className="btn reject" type="button" onClick={() => cast(false)} disabled={busy}>
+          <button className="btn reject" type="button" onClick={() => cast(false)} disabled={busy || hasVoted}>
             <Vote size={17} aria-hidden="true" />
             No
           </button>
@@ -1329,6 +1351,8 @@ function applyBackendEvent(current, event) {
       return { ...current, vote: event.payload };
     case "peers":
       return { ...current, peers: event.payload ?? [] };
+    case "peer_names":
+      return { ...current, peerNames: event.payload ?? [] };
     default:
       return current;
   }
@@ -1435,7 +1459,7 @@ function formatLogTime(value) {
   });
 }
 
-function buildPeerNames(messages, localPeerId, localName) {
+function buildPeerNames(messages, localPeerId, localName, claims = []) {
   const names = new Map();
   if (localPeerId && localName) {
     names.set(localPeerId, localName);
@@ -1443,6 +1467,11 @@ function buildPeerNames(messages, localPeerId, localName) {
   for (const record of messages) {
     if (record.peer_id && record.author) {
       names.set(record.peer_id, record.author);
+    }
+  }
+  for (const claim of claims || []) {
+    if (claim.peer_id && claim.name) {
+      names.set(claim.peer_id, claim.name);
     }
   }
   return names;
@@ -1488,6 +1517,7 @@ async function previewInvoke(command, args = {}) {
       emitPreview("backend-event", { type: "playback", payload: previewPlayback() });
       emitPreview("backend-event", { type: "queue", payload: previewQueue() });
       emitPreview("backend-event", { type: "peers", payload: previewPeers() });
+      emitPreview("backend-event", { type: "peer_names", payload: previewPeerNames() });
       return;
     case "send_chat":
       emitPreview("backend-event", {
@@ -1518,6 +1548,9 @@ async function previewInvoke(command, args = {}) {
           approvals: 1,
           rejections: 0,
           threshold: 2,
+          eligible_peers: 3,
+          pending: 2,
+          local_vote: true,
         },
       });
       emitPreview("backend-event", { type: "status", payload: "move vote requested" });
@@ -1591,6 +1624,13 @@ function previewMessages() {
       text: "Yes. The drift correction feels steady now.",
       sent_at: now - 90_000_000,
     },
+  ];
+}
+
+function previewPeerNames() {
+  return [
+    { peer_id: "12D3KooW-alice", name: "alice" },
+    { peer_id: "12D3KooW-bob", name: "bob" },
   ];
 }
 

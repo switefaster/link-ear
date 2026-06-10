@@ -15,7 +15,8 @@ connections when direct addresses become usable so relay traffic stays bounded.
 - `src/backend.rs`: main libp2p runtime, protocol message handling, history sync,
   queue sync, voting, playback state sync, relay-to-direct promotion.
 - `src/core.rs`: shared protocol and UI-facing data types plus small utilities.
-- `src/main.rs`: terminal UI bootstrap and command parsing.
+- `src/main.rs`: legacy terminal UI bootstrap and command parsing. Keep it
+  compiling for now, but desktop/Tauri is the primary user-facing path.
 - `src/bin/link-ear-relay.rs`: public relay/rendezvous node plus topology
   dashboard.
 - `src-tauri/src/main.rs`: Tauri command bridge into the Rust backend.
@@ -61,7 +62,14 @@ guardrail:
 - The desktop transport exposes play/pause as a single state-driven control.
   It should still map to the existing `pause` and `resume` backend commands.
 - Volume is a local playback setting. It should not enter room votes or shared
-  playback wire state.
+  playback wire state, and changing it should not rebuild the audio sink.
+- Bilibili/audio downloads for playback prepare run off the main swarm event
+  loop. Skip/cancel may arrive while a download is in flight; stale download
+  results must be ignored by session id and track id.
+- Each peer may cast only one ballot per vote. Votes should resolve early when
+  they reach majority or when remaining pending peers can no longer make the
+  vote pass. UI vote views should expose approvals, rejections, pending count,
+  and the local peer's ballot without changing the P2P wire schema.
 - Vote thresholds and playback ready expected peers count real room peers only:
   include the local peer, exclude relay/rendezvous infrastructure peers.
 - Gossipsub publish paths for chat, history sync, queue sync, playback, and
@@ -84,7 +92,12 @@ guardrail:
 - History summary handling should consider both message count and newest
   timestamp; equal counts do not prove histories have converged.
 - Desktop chat history must remain scrollable for old messages. New messages
-  may auto-follow only while the user is already near the latest message.
+  may auto-follow only while the user is already near the latest message. The
+  chat composer should handle IME composition correctly on Linux/WebKit as well
+  as Windows.
+- Peer display names are UI aliases learned from name claims and chat/history
+  records. Queue requester and playback leader labels should use those aliases
+  when available, but peer id remains the unique identity.
 - Desktop status logs are structured on the frontend from existing status
   events. Keep backend status text low-noise and actionable; do not add P2P wire
   fields solely to support log filtering or presentation.

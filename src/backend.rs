@@ -37,12 +37,12 @@ use crate::{
     },
     core::{
         ChatRecord, FrontendEvent as UiEvent, MAX_MESSAGES, NetworkCommand, PeerNameClaim,
-        PlaybackState, PlaybackView, QueueItem, QueueState, VoteAction, VoteProposal, WireMessage,
-        normalize_timestamp_micros,
+        PeerNameView, PlaybackState, PlaybackView, QueueItem, QueueState, VoteAction, VoteProposal,
+        WireMessage, normalize_timestamp_micros,
     },
     music_state::{
-        MusicState, PlaybackReadyOutcome, can_control_playback, can_play_at_position,
-        describe_vote_action, is_queue_state_newer, majority_threshold,
+        MusicState, PlaybackReadyOutcome, VoteCastOutcome, VoteResolution, can_control_playback,
+        can_play_at_position, describe_vote_action, is_queue_state_newer, majority_threshold,
         normalize_remote_playback_state, playback_position_ms, playback_should_be_audible,
         queue_item_at, should_apply_playback_state,
     },
@@ -123,6 +123,14 @@ enum FinishedPlaybackRole {
     Follower,
 }
 
+#[derive(Debug)]
+struct AudioDownloadResult {
+    session_id: String,
+    track_id: String,
+    title: String,
+    audio: std::result::Result<Vec<u8>, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingDirectSyncRequest {
     History { peer_id: String },
@@ -149,6 +157,8 @@ pub async fn run_network(
         .map_err(|err| anyhow!("invalid rendezvous namespace '{}': {err}", config.topic))?;
     let mut music = MusicState::new();
     let http_client = bilibili::client()?;
+    let (audio_download_tx, mut audio_download_rx) = mpsc::channel(16);
+    let mut pending_audio_downloads = HashSet::new();
     let mut audio_player = match player::AudioPlayer::new() {
         Ok(player) => Some(player),
         Err(err) => {
@@ -370,6 +380,8 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &audio_download_tx,
+                                &mut pending_audio_downloads,
                                 &mut swarm,
                                 &topic,
                                 &targets,
@@ -403,6 +415,8 @@ pub async fn run_network(
                             &mut music,
                             &mut audio_player,
                             &http_client,
+                            &audio_download_tx,
+                            &mut pending_audio_downloads,
                             &mut swarm,
                             &topic,
                             &targets,
@@ -431,6 +445,8 @@ pub async fn run_network(
                             &mut music,
                             &mut audio_player,
                             &http_client,
+                            &audio_download_tx,
+                            &mut pending_audio_downloads,
                             &mut swarm,
                             &topic,
                             &targets,
@@ -477,6 +493,8 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &audio_download_tx,
+                                &mut pending_audio_downloads,
                                 &mut swarm,
                                 &topic,
                                 &targets,
@@ -512,6 +530,8 @@ pub async fn run_network(
                             &mut music,
                             &mut audio_player,
                             &http_client,
+                            &audio_download_tx,
+                            &mut pending_audio_downloads,
                             &mut swarm,
                             &topic,
                             &targets,
@@ -560,6 +580,8 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &audio_download_tx,
+                                &mut pending_audio_downloads,
                                 &mut swarm,
                                 &topic,
                                 &targets,
@@ -592,6 +614,8 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &audio_download_tx,
+                                &mut pending_audio_downloads,
                                 &mut swarm,
                                 &topic,
                                 &targets,
@@ -618,6 +642,8 @@ pub async fn run_network(
                         &mut music,
                         &mut audio_player,
                         &http_client,
+                        &audio_download_tx,
+                        &mut pending_audio_downloads,
                         &mut swarm,
                         &topic,
                         &targets,
@@ -644,6 +670,8 @@ pub async fn run_network(
                         &ui,
                         &music,
                         majority_threshold(room_peer_total),
+                        room_peer_total,
+                        local_peer_id,
                     )
                     .await;
                 }
@@ -652,6 +680,8 @@ pub async fn run_network(
                     &mut music,
                     &mut audio_player,
                     &http_client,
+                    &audio_download_tx,
+                    &mut pending_audio_downloads,
                     &mut swarm,
                     &topic,
                     &targets,
@@ -715,6 +745,8 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &audio_download_tx,
+                                &mut pending_audio_downloads,
                                 &mut swarm,
                                 &topic,
                                 &targets,
@@ -844,6 +876,28 @@ pub async fn run_network(
                 )
                 .await;
             },
+            Some(download) = audio_download_rx.recv() => {
+                pending_audio_downloads.remove(&download.session_id);
+                let targets = PublishTargets {
+                    topic_name: &config.topic,
+                    peer_routes: connections.routes(),
+                    rendezvous_nodes: &rendezvous_nodes,
+                };
+                if let Err(err) = handle_audio_download_result(
+                    download,
+                    &mut music,
+                    &mut audio_player,
+                    &mut swarm,
+                    &topic,
+                    &targets,
+                    local_peer_id,
+                    &ui,
+                )
+                .await
+                {
+                    send_status(&ui, format!("audio load failed: {err:#}")).await;
+                }
+            },
             event = swarm.select_next_some() => {
                 let ctx = HistoryContext {
                     topic: &topic,
@@ -859,6 +913,8 @@ pub async fn run_network(
                     pending_direct_sync_requests: &mut pending_direct_sync_requests,
                     pending_sync_summaries: &mut pending_sync_summaries,
                     http_client: &http_client,
+                    audio_download_tx: &audio_download_tx,
+                    pending_audio_downloads: &mut pending_audio_downloads,
                     audio_player: &mut audio_player,
                     music: &mut music,
                 };
@@ -917,6 +973,8 @@ struct HistoryContext<'a> {
         &'a mut HashMap<request_response::OutboundRequestId, PendingDirectSyncRequest>,
     pending_sync_summaries: &'a mut VecDeque<Instant>,
     http_client: &'a reqwest::Client,
+    audio_download_tx: &'a mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &'a mut HashSet<String>,
     audio_player: &'a mut Option<player::AudioPlayer>,
     music: &'a mut MusicState,
 }
@@ -1088,7 +1146,9 @@ async fn handle_swarm_event(
             apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects).await;
 
             if num_established == 0 {
-                forget_peer_name(peer_id, &mut *ctx.peer_names);
+                if forget_peer_name(peer_id, &mut *ctx.peer_names) {
+                    send_peer_names(ui, &*ctx.peer_names).await;
+                }
                 let count = connected_room_peer_count(swarm, rendezvous_nodes);
                 let _ = ui.send(UiEvent::PeerCount(count)).await;
                 let peer_id = peer_id.to_string();
@@ -1146,7 +1206,9 @@ async fn handle_swarm_event(
                 if connections.forget_direct_address(peer_id, address) {
                     send_peer_views(ui, connections, rendezvous_nodes).await;
                 }
-                forget_peer_name(peer_id, &mut *ctx.peer_names);
+                if forget_peer_name(peer_id, &mut *ctx.peer_names) {
+                    send_peer_names(ui, &*ctx.peer_names).await;
+                }
                 if !is_peer_connected(swarm, peer_id) {
                     let effects = connections.untrack_gossip_peer(peer_id);
                     apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects)
@@ -1922,14 +1984,17 @@ async fn apply_wire_message(
             ..
         } => {
             if let Some(peer_id) = parse_peer_id(&peer_id) {
-                remember_peer_name(
+                if remember_peer_name(
                     peer_id,
                     &name,
                     ctx.local_peer_id,
                     &mut *ctx.peer_names,
                     joined_at,
                 )
-                .await;
+                .await
+                {
+                    send_peer_names(ui, &*ctx.peer_names).await;
+                }
                 true
             } else {
                 false
@@ -2028,9 +2093,10 @@ async fn apply_wire_message(
 
             if is_for_me {
                 let mut added = 0;
+                let mut names_changed = false;
                 for record in messages {
                     if let Some(peer_id) = parse_peer_id(&record.peer_id) {
-                        remember_peer_name(
+                        names_changed |= remember_peer_name(
                             peer_id,
                             &record.author,
                             ctx.local_peer_id,
@@ -2045,6 +2111,9 @@ async fn apply_wire_message(
                     }
                 }
 
+                if names_changed {
+                    send_peer_names(ui, &*ctx.peer_names).await;
+                }
                 if added > 0 {
                     send_history_snapshot(ui, ctx.history).await;
                     send_status(
@@ -2220,6 +2289,8 @@ async fn apply_wire_message(
                 );
                 match apply_playback_prepare(
                     ctx.http_client,
+                    ctx.audio_download_tx,
+                    ctx.pending_audio_downloads,
                     &mut *ctx.audio_player,
                     ctx.music,
                     &state,
@@ -2321,14 +2392,14 @@ async fn apply_wire_message(
                 Ok(()) => {
                     let known_version = ctx.music.queue_version;
                     let known_updated_at_micros = ctx.music.queue_updated_at;
+                    let room_peer_total =
+                        room_peer_count(swarm, rendezvous_nodes, ctx.local_peer_id);
                     send_vote_view(
                         ui,
                         ctx.music,
-                        majority_threshold(room_peer_count(
-                            swarm,
-                            rendezvous_nodes,
-                            ctx.local_peer_id,
-                        )),
+                        majority_threshold(room_peer_total),
+                        room_peer_total,
+                        ctx.local_peer_id,
                     )
                     .await;
                     send_status(
@@ -2397,13 +2468,15 @@ async fn apply_wire_message(
                 }
             }
             if changed_vote {
-                send_vote_view(ui, ctx.music, threshold).await;
+                send_vote_view(ui, ctx.music, threshold, room_peer_total, ctx.local_peer_id).await;
             }
 
             if let Err(err) = resolve_active_vote(
                 ctx.music,
                 ctx.audio_player,
                 ctx.http_client,
+                ctx.audio_download_tx,
+                ctx.pending_audio_downloads,
                 swarm,
                 ctx.topic,
                 &targets,
@@ -2434,14 +2507,17 @@ async fn apply_chat_message(
     source_peer_id: PeerId,
 ) -> bool {
     let claimed_peer_id = parse_peer_id(&peer_id).unwrap_or(source_peer_id);
-    remember_peer_name(
+    if remember_peer_name(
         claimed_peer_id,
         &name,
         ctx.local_peer_id,
         &mut *ctx.peer_names,
         joined_at,
     )
-    .await;
+    .await
+    {
+        send_peer_names(ui, &*ctx.peer_names).await;
+    }
 
     let id = id.unwrap_or_else(|| new_message_id(source_peer_id, sent_at, 0, &text));
     let record = ChatRecord {
@@ -2529,6 +2605,8 @@ async fn resolve_active_vote_after_queue_apply(
         ctx.music,
         ctx.audio_player,
         ctx.http_client,
+        ctx.audio_download_tx,
+        ctx.pending_audio_downloads,
         swarm,
         ctx.topic,
         targets,
@@ -2547,8 +2625,20 @@ async fn send_queue_view(ui: &mpsc::Sender<UiEvent>, local_peer_id: PeerId, musi
         .await;
 }
 
-async fn send_vote_view(ui: &mpsc::Sender<UiEvent>, music: &MusicState, threshold: usize) {
-    let _ = ui.send(UiEvent::Vote(music.vote_view(threshold))).await;
+async fn send_vote_view(
+    ui: &mpsc::Sender<UiEvent>,
+    music: &MusicState,
+    threshold: usize,
+    eligible_peers: usize,
+    local_peer_id: PeerId,
+) {
+    let _ = ui
+        .send(UiEvent::Vote(music.vote_view(
+            threshold,
+            eligible_peers,
+            &local_peer_id.to_string(),
+        )))
+        .await;
 }
 
 async fn remember_peer_name(
@@ -2557,24 +2647,43 @@ async fn remember_peer_name(
     local_peer_id: PeerId,
     peer_names: &mut HashMap<String, PeerNameClaim>,
     joined_at: Option<i64>,
-) {
+) -> bool {
     if peer_id == local_peer_id {
-        return;
+        return false;
     }
 
     let peer_id = peer_id.to_string();
-    peer_names.insert(
-        peer_id,
-        PeerNameClaim {
-            name: name.to_string(),
-            joined_at,
-        },
-    );
+    let next = PeerNameClaim {
+        name: name.to_string(),
+        joined_at,
+    };
+    let changed = peer_names
+        .get(&peer_id)
+        .is_none_or(|current| current.name != next.name || current.joined_at != next.joined_at);
+    peer_names.insert(peer_id, next);
+    changed
 }
 
-fn forget_peer_name(peer_id: PeerId, peer_names: &mut HashMap<String, PeerNameClaim>) {
+fn forget_peer_name(peer_id: PeerId, peer_names: &mut HashMap<String, PeerNameClaim>) -> bool {
     let peer_id = peer_id.to_string();
-    peer_names.remove(&peer_id);
+    peer_names.remove(&peer_id).is_some()
+}
+
+async fn send_peer_names(ui: &mpsc::Sender<UiEvent>, peer_names: &HashMap<String, PeerNameClaim>) {
+    let mut names = peer_names
+        .iter()
+        .map(|(peer_id, claim)| PeerNameView {
+            peer_id: peer_id.clone(),
+            name: claim.name.clone(),
+            joined_at: claim.joined_at,
+        })
+        .collect::<Vec<_>>();
+    names.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.peer_id.cmp(&right.peer_id))
+    });
+    let _ = ui.send(UiEvent::PeerNames(names)).await;
 }
 
 fn parse_peer_id(value: &str) -> Option<PeerId> {
@@ -3025,10 +3134,158 @@ fn build_queue_state(local_peer_id: PeerId, music: &MusicState) -> QueueState {
     music.queue_state(local_peer_id)
 }
 
+fn schedule_audio_download(
+    client: &reqwest::Client,
+    audio_download_tx: &mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &mut HashSet<String>,
+    session_id: &str,
+    track: &crate::core::PlaybackTrack,
+) -> Result<()> {
+    if !pending_audio_downloads.insert(session_id.to_string()) {
+        return Ok(());
+    }
+
+    let client = client.clone();
+    let sender = audio_download_tx.clone();
+    let session_id = session_id.to_string();
+    let track = track.clone();
+    tokio::spawn(async move {
+        let result = bilibili::download_audio(&client, &track)
+            .await
+            .map_err(|err| format!("{err:#}"));
+        let _ = sender
+            .send(AudioDownloadResult {
+                session_id,
+                track_id: track.track_id,
+                title: track.title,
+                audio: result,
+            })
+            .await;
+    });
+
+    Ok(())
+}
+
+async fn handle_audio_download_result(
+    download: AudioDownloadResult,
+    music: &mut MusicState,
+    audio_player: &mut Option<player::AudioPlayer>,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    topic: &gossipsub::IdentTopic,
+    targets: &PublishTargets<'_>,
+    local_peer_id: PeerId,
+    ui: &mpsc::Sender<UiEvent>,
+) -> Result<()> {
+    let Some(state) = music
+        .playback_state()
+        .filter(|state| {
+            state.session_id == download.session_id
+                && state
+                    .track
+                    .as_ref()
+                    .is_some_and(|track| track.track_id == download.track_id)
+        })
+        .cloned()
+    else {
+        send_status(
+            ui,
+            format!("ignored stale audio download for {}", download.title),
+        )
+        .await;
+        return Ok(());
+    };
+
+    let was_pending = music.has_pending_playback();
+    let is_leader = state.leader_peer_id == local_peer_id.to_string();
+    let audio = match download.audio {
+        Ok(audio) => audio,
+        Err(err) => {
+            send_status(
+                ui,
+                format!("audio download failed for {}: {err}", download.title),
+            )
+            .await;
+            if is_leader {
+                if let Some(cancel) =
+                    music.take_local_pending_cancel(local_peer_id, "local audio download failed")
+                {
+                    publish_playback_cancel(
+                        swarm,
+                        topic,
+                        targets,
+                        &cancel.session_id,
+                        local_peer_id,
+                        &cancel.reason,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+    };
+
+    if let Some(player) = audio_player.as_mut() {
+        let now = current_timestamp_micros();
+        let position_ms = if was_pending {
+            0
+        } else {
+            playback_position_ms(&state, now)
+        };
+        let playing = !was_pending && playback_should_be_audible(&state, now);
+        if let Err(err) = player.load(
+            download.track_id.clone(),
+            Arc::<[u8]>::from(audio.into_boxed_slice()),
+            position_ms,
+            playing,
+            now,
+        ) {
+            send_status(
+                ui,
+                format!("audio load failed for {}: {err:#}", download.title),
+            )
+            .await;
+            if is_leader {
+                if let Some(cancel) =
+                    music.take_local_pending_cancel(local_peer_id, "local audio failed to load")
+                {
+                    publish_playback_cancel(
+                        swarm,
+                        topic,
+                        targets,
+                        &cancel.session_id,
+                        local_peer_id,
+                        &cancel.reason,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    send_status(ui, "local audio ready".to_string()).await;
+    if !was_pending {
+        return Ok(());
+    }
+
+    if is_leader {
+        let _ = music.mark_playback_ready(
+            &download.session_id,
+            &local_peer_id.to_string(),
+            local_peer_id,
+        );
+        maybe_start_pending_playback(music, swarm, topic, targets, local_peer_id, ui).await?;
+    } else {
+        publish_playback_ready(swarm, topic, targets, &download.session_id, local_peer_id)?;
+    }
+
+    Ok(())
+}
+
 async fn start_next_if_idle(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    audio_download_tx: &mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &mut HashSet<String>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
@@ -3049,6 +3306,8 @@ async fn start_next_if_idle(
         item,
         audio_player,
         client,
+        audio_download_tx,
+        pending_audio_downloads,
         swarm,
         topic,
         targets,
@@ -3063,6 +3322,8 @@ async fn begin_playback_prepare(
     item: QueueItem,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    audio_download_tx: &mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &mut HashSet<String>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
@@ -3107,59 +3368,29 @@ async fn begin_playback_prepare(
     let Some(track) = prepare.state.track.as_ref() else {
         return Ok(());
     };
-    let audio = match bilibili::download_audio(client, track).await {
-        Ok(audio) => audio,
-        Err(err) => {
-            if let Some(cancel) =
-                music.take_local_pending_cancel(local_peer_id, "local audio download failed")
-            {
-                publish_playback_cancel(
-                    swarm,
-                    topic,
-                    targets,
-                    &cancel.session_id,
-                    local_peer_id,
-                    &cancel.reason,
-                )?;
-            }
-            return Err(err);
-        }
-    };
 
-    let ready = if let Some(player) = audio_player.as_mut() {
-        player
-            .load(
-                track.track_id.clone(),
-                Arc::<[u8]>::from(audio.into_boxed_slice()),
-                0,
-                false,
-                current_timestamp_micros(),
-            )
-            .is_ok()
-    } else {
-        true
-    };
-
-    if ready {
-        let _ = music.mark_playback_ready(
+    if audio_player.is_some() {
+        schedule_audio_download(
+            client,
+            audio_download_tx,
+            pending_audio_downloads,
             &prepare.state.session_id,
-            &local_peer_id.to_string(),
-            local_peer_id,
-        );
-        send_status(ui, "local audio ready".to_string()).await;
-        maybe_start_pending_playback(music, swarm, topic, targets, local_peer_id, ui).await?;
-    } else if let Some(cancel) =
-        music.take_local_pending_cancel(local_peer_id, "local audio failed to load")
-    {
-        publish_playback_cancel(
-            swarm,
-            topic,
-            targets,
-            &cancel.session_id,
-            local_peer_id,
-            &cancel.reason,
+            track,
         )?;
+        return Ok(());
     }
+
+    let _ = music.mark_playback_ready(
+        &prepare.state.session_id,
+        &local_peer_id.to_string(),
+        local_peer_id,
+    );
+    send_status(
+        ui,
+        "audio output unavailable; local prepare accepted".to_string(),
+    )
+    .await;
+    maybe_start_pending_playback(music, swarm, topic, targets, local_peer_id, ui).await?;
 
     Ok(())
 }
@@ -3200,6 +3431,8 @@ async fn propose_or_execute_vote(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    audio_download_tx: &mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &mut HashSet<String>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
@@ -3246,7 +3479,7 @@ async fn propose_or_execute_vote(
         .as_ref()
         .map_or(0, |vote| vote.approval_count());
     let threshold = majority_threshold(room_peer_count);
-    send_vote_view(ui, music, threshold).await;
+    send_vote_view(ui, music, threshold, room_peer_count, local_peer_id).await;
     send_status(
         ui,
         format!(
@@ -3262,6 +3495,8 @@ async fn propose_or_execute_vote(
         music,
         audio_player,
         client,
+        audio_download_tx,
+        pending_audio_downloads,
         swarm,
         topic,
         targets,
@@ -3279,6 +3514,8 @@ async fn cast_vote(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    audio_download_tx: &mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &mut HashSet<String>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
@@ -3291,9 +3528,16 @@ async fn cast_vote(
     >,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
-    let Some(vote_id) = music.cast_vote(local_peer_id.to_string(), approve) else {
+    let Some(vote_outcome) = music.cast_vote(local_peer_id.to_string(), approve) else {
         send_status(ui, "no active vote".to_string()).await;
         return Ok(());
+    };
+    let vote_id = match vote_outcome {
+        VoteCastOutcome::Accepted { vote_id } => vote_id,
+        VoteCastOutcome::Duplicate { vote_id } => {
+            send_status(ui, format!("already voted on {vote_id}")).await;
+            return Ok(());
+        }
     };
 
     publish_vote_ballot(swarm, topic, targets, &vote_id, local_peer_id, approve)?;
@@ -3302,12 +3546,21 @@ async fn cast_vote(
         format!("voted {} on {vote_id}", if approve { "yes" } else { "no" }),
     )
     .await;
-    send_vote_view(ui, music, majority_threshold(room_peer_count)).await;
+    send_vote_view(
+        ui,
+        music,
+        majority_threshold(room_peer_count),
+        room_peer_count,
+        local_peer_id,
+    )
+    .await;
 
     resolve_active_vote(
         music,
         audio_player,
         client,
+        audio_download_tx,
+        pending_audio_downloads,
         swarm,
         topic,
         targets,
@@ -3324,6 +3577,8 @@ async fn resolve_active_vote(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    audio_download_tx: &mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &mut HashSet<String>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
@@ -3354,19 +3609,35 @@ async fn resolve_active_vote(
         return Ok(());
     }
 
-    let Some(proposal) = music.resolve_vote(threshold) else {
+    let Some(resolution) = music.resolve_vote(threshold, room_peer_count) else {
         return Ok(());
     };
 
-    send_vote_view(ui, music, threshold).await;
-    send_status(
-        ui,
-        format!(
-            "vote passed: {}",
-            describe_vote_action(&proposal.action, &music.queue)
-        ),
-    )
-    .await;
+    send_vote_view(ui, music, threshold, room_peer_count, local_peer_id).await;
+    let proposal = match resolution {
+        VoteResolution::Passed(proposal) => {
+            send_status(
+                ui,
+                format!(
+                    "vote passed: {}",
+                    describe_vote_action(&proposal.action, &music.queue)
+                ),
+            )
+            .await;
+            proposal
+        }
+        VoteResolution::Rejected(proposal) => {
+            send_status(
+                ui,
+                format!(
+                    "vote rejected: {}",
+                    describe_vote_action(&proposal.action, &music.queue)
+                ),
+            )
+            .await;
+            return Ok(());
+        }
+    };
 
     if let Some(reason) = music.stale_vote_reason(&proposal) {
         send_status(ui, format!("vote discarded: {reason}")).await;
@@ -3379,6 +3650,8 @@ async fn resolve_active_vote(
             music,
             audio_player,
             client,
+            audio_download_tx,
+            pending_audio_downloads,
             swarm,
             topic,
             targets,
@@ -3396,6 +3669,8 @@ async fn execute_vote_action(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    audio_download_tx: &mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &mut HashSet<String>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
@@ -3441,6 +3716,8 @@ async fn execute_vote_action(
                     music,
                     audio_player,
                     client,
+                    audio_download_tx,
+                    pending_audio_downloads,
                     swarm,
                     topic,
                     targets,
@@ -3716,6 +3993,8 @@ async fn maybe_start_pending_playback(
 
 async fn apply_playback_prepare(
     client: &reqwest::Client,
+    audio_download_tx: &mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &mut HashSet<String>,
     audio_player: &mut Option<player::AudioPlayer>,
     music: &mut MusicState,
     state: &PlaybackState,
@@ -3738,26 +4017,24 @@ async fn apply_playback_prepare(
     };
 
     send_status(ui, format!("preparing {}", track.title)).await;
-    let Some(player) = audio_player.as_mut() else {
+    if audio_player.is_none() {
         send_status(
             ui,
             "audio output unavailable; confirming prepare".to_string(),
         )
         .await;
         return Ok(true);
-    };
+    }
 
     send_status(ui, format!("downloading {}", track.title)).await;
-    let audio = bilibili::download_audio(client, track).await?;
-    player.load(
-        track.track_id.clone(),
-        Arc::<[u8]>::from(audio.into_boxed_slice()),
-        0,
-        false,
-        current_timestamp_micros(),
+    schedule_audio_download(
+        client,
+        audio_download_tx,
+        pending_audio_downloads,
+        &state.session_id,
+        track,
     )?;
-    send_status(ui, "local audio ready".to_string()).await;
-    Ok(true)
+    Ok(false)
 }
 
 async fn apply_playback_cancel(

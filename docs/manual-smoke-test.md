@@ -109,6 +109,8 @@ Capture on failure:
 3. Watch the prepare phase on all peers.
 4. Disconnect Peer C before it reports ready.
 5. Keep Peer A and Peer B connected.
+6. Start another track and request skip while at least one peer is still
+   downloading/preparing audio.
 
 Pass signals:
 
@@ -117,6 +119,8 @@ Pass signals:
 - No peer remains forever at `starting playback ... ready wait timed out`.
 - When a track finishes, followers move to idle locally and the leader starts
   the next queued item.
+- Skip can be voted on while download/prepare is still in flight; old download
+  completion does not restart the skipped session.
 
 Capture on failure:
 
@@ -132,12 +136,19 @@ With an active track:
 2. Let one normal playback state refresh happen during the vote.
 3. Approve the pause vote from a majority.
 4. Repeat for resume and skip.
+5. In a separate vote, have the same peer try to vote yes and then no.
+6. In a three-peer room, have two peers reject a vote.
 
 Pass signals:
 
 - The vote modal remains visible during same-session playback refreshes.
 - Pause, resume, and skip always require a vote.
 - Vote result applies deterministically on every peer that receives it.
+- Each peer gets one ballot per vote; repeat ballots do not change the count.
+- The vote modal shows yes, no, and pending counts, with rejection count visible
+  in red.
+- A vote closes early when majority is reached or when enough rejections make
+  majority impossible.
 
 Seek rules:
 
@@ -178,6 +189,7 @@ Capture on failure:
 ## UI Regression Checks
 
 - Chinese IME composition does not submit partial text when pressing Enter.
+- Linux WebKit/iBus/fcitx input can enter Chinese text in the composer.
 - Queue drawer has no insert-position field.
 - Pointer drag or keyboard move controls open a move vote.
 - The combined play/pause button maps to pause while playing and resume while
@@ -187,6 +199,11 @@ Capture on failure:
 - Peer overview opens from `N peers` and shows direct/relay diagnostics.
 - Status log search and filters work without losing new status lines.
 - Duplicate display names can send chat; peer id remains the unique identity.
+- Queue requester and playback leader labels show display aliases when known,
+  while still allowing short peer id disambiguation.
+- Long playback titles scroll or truncate without overlapping transport
+  controls.
+- The empty chat view does not show an extra framed empty panel.
 
 ## Run Exit Criteria
 

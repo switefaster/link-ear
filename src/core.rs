@@ -24,6 +24,13 @@ pub struct PeerNameClaim {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerNameView {
+    pub peer_id: String,
+    pub name: String,
+    pub joined_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackTrack {
     pub track_id: String,
     pub title: String,
@@ -106,6 +113,9 @@ pub struct VoteView {
     pub approvals: usize,
     pub rejections: usize,
     pub threshold: usize,
+    pub eligible_peers: usize,
+    pub pending: usize,
+    pub local_vote: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +144,7 @@ pub enum FrontendEvent {
     Queue(QueueState),
     Vote(Option<VoteView>),
     Peers(Vec<PeerConnectionView>),
+    PeerNames(Vec<PeerNameView>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +290,13 @@ pub struct ActiveVote {
     pub deadline: Instant,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum VoteTerminalOutcome {
+    Pending,
+    Passed,
+    Rejected,
+}
+
 impl PendingPlayback {
     pub fn new(state: PlaybackState, expected_peers: HashSet<String>, deadline: Instant) -> Self {
         Self {
@@ -320,18 +338,55 @@ impl ActiveVote {
         }
     }
 
-    pub fn vote(&mut self, peer_id: String, approve: bool) {
-        self.approvals.remove(&peer_id);
-        self.rejections.remove(&peer_id);
+    pub fn vote(&mut self, peer_id: String, approve: bool) -> bool {
+        if self.approvals.contains(&peer_id) || self.rejections.contains(&peer_id) {
+            return false;
+        }
+
         if approve {
-            self.approvals.insert(peer_id);
+            self.approvals.insert(peer_id)
         } else {
-            self.rejections.insert(peer_id);
+            self.rejections.insert(peer_id)
         }
     }
 
     pub fn approval_count(&self) -> usize {
         self.approvals.len()
+    }
+
+    pub fn rejection_count(&self) -> usize {
+        self.rejections.len()
+    }
+
+    pub fn local_vote(&self, peer_id: &str) -> Option<bool> {
+        if self.approvals.contains(peer_id) {
+            Some(true)
+        } else if self.rejections.contains(peer_id) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    pub fn pending_count(&self, eligible_peers: usize) -> usize {
+        eligible_peers.saturating_sub(self.approvals.len() + self.rejections.len())
+    }
+
+    pub fn terminal_outcome(&self, threshold: usize, eligible_peers: usize) -> VoteTerminalOutcome {
+        if self.approvals.len() >= threshold {
+            return VoteTerminalOutcome::Passed;
+        }
+
+        if self
+            .approvals
+            .len()
+            .saturating_add(self.pending_count(eligible_peers))
+            < threshold
+        {
+            return VoteTerminalOutcome::Rejected;
+        }
+
+        VoteTerminalOutcome::Pending
     }
 }
 
@@ -425,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn active_vote_replaces_peer_ballot() {
+    fn active_vote_accepts_only_one_ballot_per_peer() {
         let proposal = VoteProposal {
             vote_id: "vote-1".to_string(),
             proposer: "alice".to_string(),
@@ -436,16 +491,54 @@ mod tests {
         };
         let mut vote = ActiveVote::new(proposal, Instant::now() + Duration::from_secs(1));
 
-        vote.vote("bob".to_string(), true);
+        assert!(vote.vote("bob".to_string(), true));
         assert_eq!(vote.approval_count(), 1);
         assert_eq!(vote.rejections.len(), 0);
 
-        vote.vote("bob".to_string(), false);
-        assert_eq!(vote.approval_count(), 0);
+        assert!(!vote.vote("bob".to_string(), false));
+        assert_eq!(vote.approval_count(), 1);
+        assert_eq!(vote.rejections.len(), 0);
+
+        assert!(vote.vote("carol".to_string(), false));
+        assert_eq!(vote.approval_count(), 1);
         assert_eq!(vote.rejections.len(), 1);
+        assert_eq!(vote.local_vote("bob"), Some(true));
+        assert_eq!(vote.local_vote("carol"), Some(false));
+        assert_eq!(vote.local_vote("dave"), None);
+    }
 
-        vote.vote("bob".to_string(), true);
-        assert_eq!(vote.approval_count(), 1);
-        assert_eq!(vote.rejections.len(), 0);
+    #[test]
+    fn active_vote_terminal_outcome_detects_pass_and_impossible_pass() {
+        let proposal = VoteProposal {
+            vote_id: "vote-1".to_string(),
+            proposer: "alice".to_string(),
+            action: VoteAction::Pause,
+            queue_version: 1,
+            playback_session_id: Some("session".to_string()),
+            created_at_micros: 1_700_000_000_000_000,
+        };
+        let mut vote = ActiveVote::new(proposal, Instant::now() + Duration::from_secs(1));
+
+        assert!(vote.vote("alice".to_string(), true));
+        assert_eq!(vote.terminal_outcome(2, 3), VoteTerminalOutcome::Pending);
+
+        assert!(vote.vote("bob".to_string(), false));
+        assert_eq!(vote.terminal_outcome(2, 3), VoteTerminalOutcome::Pending);
+
+        assert!(vote.vote("carol".to_string(), false));
+        assert_eq!(vote.terminal_outcome(2, 3), VoteTerminalOutcome::Rejected);
+
+        let proposal = VoteProposal {
+            vote_id: "vote-2".to_string(),
+            proposer: "alice".to_string(),
+            action: VoteAction::Pause,
+            queue_version: 1,
+            playback_session_id: Some("session".to_string()),
+            created_at_micros: 1_700_000_000_000_000,
+        };
+        let mut vote = ActiveVote::new(proposal, Instant::now() + Duration::from_secs(1));
+        assert!(vote.vote("alice".to_string(), true));
+        assert!(vote.vote("bob".to_string(), true));
+        assert_eq!(vote.terminal_outcome(2, 3), VoteTerminalOutcome::Passed);
     }
 }

@@ -1021,9 +1021,13 @@ h2 {
   line-height: 1.35;
 }
 
-.composer input {
+.composer textarea {
   flex: 1 1 auto;
   min-height: 44px;
+  max-height: 96px;
+  resize: none;
+  line-height: 1.25;
+  overflow-y: auto;
 }
 
 .composer .btn {
@@ -1234,6 +1238,44 @@ h2 {
   min-height: 170px;
 }
 
+.track-title {
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.track-title span {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
+.track-title.scrolling span {
+  min-width: 100%;
+  max-width: none;
+  padding-right: 40px;
+  overflow: visible;
+  text-overflow: clip;
+  animation: title-marquee 12s linear infinite;
+}
+
+.track-title.scrolling:hover span,
+.track-title.scrolling:focus-within span {
+  animation-play-state: paused;
+}
+
+@keyframes title-marquee {
+  0%,
+  16% {
+    transform: translateX(0);
+  }
+  84%,
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
 .modal-scrim {
   z-index: 50;
   display: grid;
@@ -1283,14 +1325,65 @@ h2 {
   width: min(420px, 100%);
 }
 
+.vote-meter {
+  position: relative;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(216, 203, 182, 0.72);
+}
+
+.vote-meter span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.vote-meter-yes {
+  left: 0;
+  background: var(--green);
+}
+
+.vote-meter-no {
+  right: 0;
+  background: #c94f3d;
+}
+
+.vote-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.vote-count {
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: rgba(255, 253, 246, 0.82);
+}
+
+.vote-count.yes {
+  color: var(--green-dark);
+}
+
+.vote-count.no {
+  color: #b34032;
+}
+
+.vote-count.pending {
+  color: var(--muted);
+}
+
 .log-scrim {
   z-index: 70;
 }
 
 .log-modal {
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   width: min(720px, 100%);
   max-height: min(680px, calc(100vh - 36px));
+  overflow: hidden;
 }
 
 .log-modal .icon-button {
@@ -1540,8 +1633,8 @@ h2 {
   display: grid;
   align-content: start;
   gap: 8px;
-  min-height: 180px;
-  max-height: min(480px, calc(100vh - 178px));
+  min-height: 0;
+  max-height: none;
   overflow: auto;
   padding-right: 1px;
   scrollbar-width: none;
@@ -1616,6 +1709,7 @@ h2 {
 }
 
 .vote-meter {
+  position: relative;
   height: 10px;
   overflow: hidden;
   border: 1px solid #c9bba2;
@@ -1624,11 +1718,22 @@ h2 {
 }
 
 .vote-meter span {
-  display: block;
+  position: absolute;
+  top: 0;
+  bottom: 0;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, var(--green), var(--cyan));
   transition: width 180ms ease;
+}
+
+.vote-meter-yes {
+  left: 0;
+  background: linear-gradient(90deg, var(--green), var(--cyan));
+}
+
+.vote-meter-no {
+  right: 0;
+  background: #c94f3d;
 }
 
 .stack {
@@ -1718,6 +1823,12 @@ h2 {
   font-size: 12px;
 }
 
+.messages-empty .empty-state {
+  min-height: auto;
+  border: 0;
+  background: transparent;
+}
+
 .signal-bars {
   display: inline-flex;
   color: var(--green);
@@ -1771,6 +1882,10 @@ h2 {
     padding: 10px;
   }
 
+  .console-page {
+    grid-template-rows: 96px minmax(0, 1fr) 272px;
+  }
+
   .setup-card {
     padding: 16px;
   }
@@ -1795,6 +1910,19 @@ h2 {
   .composer,
   .field-row {
     flex-wrap: wrap;
+  }
+
+  .player-dock {
+    align-content: start;
+  }
+
+  .player-dock .transport-buttons {
+    justify-content: flex-start;
+  }
+
+  .player-dock .volume-control {
+    flex: 1 1 100%;
+    min-width: 0;
   }
 
   .composer .btn,

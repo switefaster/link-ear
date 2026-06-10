@@ -143,8 +143,19 @@ pub async fn resolve_track(
         .ok_or_else(|| anyhow!("part {} does not exist", part_index + 1))?;
 
     let player = resolve_player_info(client, bvid, page.cid, &referer).await?;
-
-    let media_url = best_media_url(player)?;
+    let media_url = match best_media_url(player) {
+        Ok(url) => url,
+        Err(err) => {
+            let legacy = resolve_player_info_legacy(client, bvid, page.cid, &referer)
+                .await
+                .with_context(|| {
+                    format!("play url had no usable media and legacy fallback failed: {err:#}")
+                })?;
+            best_media_url(legacy).with_context(|| {
+                format!("legacy play url had no usable media after WBI media failure: {err:#}")
+            })?
+        }
+    };
 
     Ok(PlaybackTrack {
         track_id: format!("bilibili:{bvid}:{}:{}", part_index + 1, page.cid),
@@ -277,6 +288,19 @@ fn best_media_url(player: BilibiliPlayerInfo) -> Result<String> {
     }
 
     bail!("bilibili media stream does not exist")
+}
+
+#[cfg(test)]
+fn best_media_url_with_fallback(
+    primary: BilibiliPlayerInfo,
+    fallback: impl FnOnce() -> Result<BilibiliPlayerInfo>,
+) -> Result<String> {
+    match best_media_url(primary) {
+        Ok(url) => Ok(url),
+        Err(err) => best_media_url(fallback()?).with_context(|| {
+            format!("fallback play url had no usable media after primary media failure: {err:#}")
+        }),
+    }
 }
 
 pub async fn download_audio(client: &Client, track: &PlaybackTrack) -> Result<Vec<u8>> {
@@ -564,6 +588,28 @@ mod tests {
         assert_eq!(
             best_media_url(player).unwrap(),
             "https://example.test/video.mp4"
+        );
+    }
+
+    #[test]
+    fn best_media_url_falls_back_when_primary_has_no_media() {
+        let primary = BilibiliPlayerInfo {
+            dash: Some(BilibiliDash { audio: None }),
+            durl: None,
+        };
+        let fallback = BilibiliPlayerInfo {
+            dash: None,
+            durl: Some(vec![BilibiliDurl {
+                order: 1,
+                size: Some(5_880_463),
+                url: String::new(),
+                backup_url: Some(vec!["https://example.test/backup.mp4".to_string()]),
+            }]),
+        };
+
+        assert_eq!(
+            best_media_url_with_fallback(primary, || Ok(fallback)).unwrap(),
+            "https://example.test/backup.mp4"
         );
     }
 

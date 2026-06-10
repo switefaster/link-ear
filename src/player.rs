@@ -1,7 +1,10 @@
 use std::{
     io::{Cursor, Read, Seek, SeekFrom},
     num::{NonZeroU16, NonZeroU32},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
@@ -29,7 +32,7 @@ pub struct AudioPlayer {
     position_ms: u64,
     started_at_micros: i64,
     playing: bool,
-    volume: f32,
+    volume: Arc<AtomicU32>,
 }
 
 #[derive(Clone)]
@@ -42,6 +45,7 @@ struct DecodedAudio {
 struct PcmSource {
     audio: DecodedAudio,
     pos: usize,
+    volume: Arc<AtomicU32>,
 }
 
 struct MemoryMediaSource {
@@ -60,7 +64,7 @@ impl AudioPlayer {
             position_ms: 0,
             started_at_micros: 0,
             playing: false,
-            volume: volume_percent_to_gain(100),
+            volume: Arc::new(AtomicU32::new(volume_percent_to_gain(100).to_bits())),
         })
     }
 
@@ -97,17 +101,14 @@ impl AudioPlayer {
         self.playing
     }
 
-    pub fn set_volume(&mut self, percent: u8, now_micros: i64) -> Result<()> {
+    pub fn set_volume(&mut self, percent: u8, _now_micros: i64) -> Result<()> {
         let gain = volume_percent_to_gain(percent);
-        if (self.volume - gain).abs() < f32::EPSILON {
+        let old = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        if (old - gain).abs() < f32::EPSILON {
             return Ok(());
         }
 
-        self.volume = gain;
-        if self.audio.is_some() {
-            let position_ms = self.position_ms(now_micros);
-            self.restart(position_ms, self.playing, now_micros)?;
-        }
+        self.volume.store(gain.to_bits(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -203,7 +204,7 @@ impl AudioPlayer {
     }
 
     fn build_sink(&self, audio: DecodedAudio, position_ms: u64, playing: bool) -> Result<Player> {
-        let source = PcmSource::new(audio, position_ms).amplify(self.volume);
+        let source = PcmSource::new(audio, position_ms, Arc::clone(&self.volume));
         let sink = Player::connect_new(self.stream.mixer());
         sink.append(source);
 
@@ -255,9 +256,9 @@ impl DecodedAudio {
 }
 
 impl PcmSource {
-    fn new(audio: DecodedAudio, position_ms: u64) -> Self {
+    fn new(audio: DecodedAudio, position_ms: u64, volume: Arc<AtomicU32>) -> Self {
         let pos = audio.position_to_sample_index(position_ms);
-        Self { audio, pos }
+        Self { audio, pos, volume }
     }
 }
 
@@ -267,7 +268,8 @@ impl Iterator for PcmSource {
     fn next(&mut self) -> Option<Self::Item> {
         let sample = *self.audio.samples.get(self.pos)?;
         self.pos += 1;
-        Some(sample)
+        let volume = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        Some(sample * volume)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -447,5 +449,20 @@ mod tests {
         assert_eq!(volume_percent_to_gain(0), 0.0);
         assert_eq!(volume_percent_to_gain(50), 0.5);
         assert_eq!(volume_percent_to_gain(100), 1.0);
+    }
+
+    #[test]
+    fn pcm_source_reads_updated_volume_without_restart() {
+        let audio = DecodedAudio {
+            samples: Arc::from([1.0_f32, 1.0, 1.0]),
+            channels: NonZeroU16::new(1).unwrap(),
+            sample_rate: NonZeroU32::new(1).unwrap(),
+        };
+        let volume = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+        let mut source = PcmSource::new(audio, 0, Arc::clone(&volume));
+
+        assert_eq!(source.next(), Some(1.0));
+        volume.store(0.25_f32.to_bits(), Ordering::Relaxed);
+        assert_eq!(source.next(), Some(0.25));
     }
 }

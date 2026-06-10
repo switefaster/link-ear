@@ -1,6 +1,6 @@
 # link-ear
 
-`link-ear` is a Rust/libp2p peer-to-peer chat and shared listening app. Peers can chat, co-manage a music queue, and keep playback state roughly synchronized through the terminal UI or the Tauri desktop shell.
+`link-ear` is a Rust/libp2p peer-to-peer chat and shared listening app. Peers can chat, co-manage a music queue, and keep playback state roughly synchronized through the Tauri desktop shell. The terminal UI still exists as a legacy/debug path and is kept compiling while the desktop flow stabilizes.
 
 ## Run
 
@@ -72,7 +72,7 @@ Useful flags:
 --no-mdns                 Disable LAN discovery
 ```
 
-Inside the TUI, type a message and press Enter. Press Esc or Ctrl+C to quit.
+Inside the legacy TUI, type a message and press Enter. Press Esc or Ctrl+C to quit.
 
 ## Desktop frontend
 
@@ -127,9 +127,11 @@ subscription is ready, relay links may close for that peer.
 
 ## Music sync
 
-Music sync uses a shared queue and playback state instead of P2P audio streaming. The peer that starts the next queue item resolves the Bilibili BV through the web API, announces a prepare phase, and every expected peer downloads the audio URL locally before playback starts. The leader broadcasts playback state every second; peers seek when local drift is larger than about `700ms`.
+Music sync uses a shared queue and playback state instead of P2P audio streaming. The peer that starts the next queue item resolves the Bilibili BV through the web API, announces a prepare phase, and every expected peer downloads the audio URL locally before playback starts. Prepare downloads run outside the main libp2p event loop, so skip/cancel/vote messages can still be processed while audio is downloading. Stale download results are ignored if the playback session or track changed.
 
-Queue enqueue is immediate and always appends. Moving tracks always opens a vote. Removing your own queued item is direct; removing another peer's queued item opens a vote. The current track requester can seek directly, while other seek requests open a vote. Pause, resume, and skip always open a vote. Majority thresholds count real room peers and exclude relay/rendezvous infrastructure peers.
+The resolver first prefers DASH audio and falls back to single-file `durl` media when needed. If WBI playurl returns HTTP 412, or a successful playurl response has no usable media URL, the backend tries the legacy playurl endpoint before reporting failure.
+
+Queue enqueue is immediate and always appends. Moving tracks always opens a vote. Removing your own queued item is direct; removing another peer's queued item opens a vote. The current track requester can seek directly, while other seek requests open a vote. Pause, resume, and skip always open a vote. Majority thresholds count real room peers and exclude relay/rendezvous infrastructure peers. Each peer may cast one ballot per vote; votes close early once they pass or once pending peers can no longer make them pass.
 
 ## Manual smoke test
 

@@ -9,7 +9,7 @@ run.
 
 | Report item | Current evidence |
 | --- | --- |
-| iBus/fcitx IME submits partial Chinese text | Desktop composer tracks composition and blocks Enter while composing in `desktop/src/main.jsx`. |
+| iBus/fcitx IME submits partial Chinese text | Desktop composer uses a single-line textarea, tracks composition, and blocks Enter while composing in `desktop/src/main.jsx`. |
 | Same-session playback refresh closes vote modal | `MusicState` keeps playback votes during same-session updates; covered by `same_session_playback_update_keeps_playback_vote`. |
 | Vote counts include relay/rendezvous peers | Room peer set excludes rendezvous and includes local peer; covered by `room_peer_set_excludes_rendezvous_nodes_and_includes_local`. |
 | Empty playback can start votes | Backend rejects pause/resume/skip/seek when no active playback; stale playback vote tests cover inactive track cases. |
@@ -28,7 +28,15 @@ run.
 | Dragging queue order does not work | Desktop queue cards support pointer drag plus keyboard move controls that open move vote confirmation. |
 | Insert-at-position should be removed | Desktop enqueue form has no position field; backend ignores `position` and always appends; README marks `/insert` as compatibility only. |
 | Duplicate display names should be allowed | Name claims are aliases keyed by peer id; covered by `peer_names_allow_duplicate_display_aliases`. |
-| Volume control | Desktop local volume command maps to `AudioPlayer::set_volume`; covered by `volume_percent_to_gain_maps_ui_range`. |
+| Volume control | Desktop local volume command maps to `AudioPlayer::set_volume`; source gain updates without rebuilding the sink. Covered by `volume_percent_to_gain_maps_ui_range` and `pcm_source_reads_updated_volume_without_restart`. |
+| One peer can change a vote after voting | `ActiveVote` accepts only one ballot per peer; covered by `active_vote_accepts_only_one_ballot_per_peer` and `duplicate_ballot_for_current_vote_is_ignored`. |
+| Votes should finish early on pass or impossible pass | `ActiveVote::terminal_outcome` and `MusicState::resolve_vote` close passed or impossible votes; covered by `active_vote_terminal_outcome_detects_pass_and_impossible_pass` and `vote_resolution_rejects_when_majority_is_impossible`. |
+| Vote UI should show rejection/pending state | `VoteView` includes eligible peer count, pending count, and local ballot; covered by `vote_view_reports_pending_and_local_vote`. Desktop vote modal renders yes/no/pending with red rejection count. |
+| Other peers' names show as peer ids in queue/leader UI | Backend emits UI-only `PeerNames` from name claims and history; desktop display lookup uses it for queue requester, peer overview, and playback leader labels. |
+| Skip cannot be requested while audio is downloading | Playback prepare downloads run through a background result channel, leaving the swarm command/event loop free to process skip votes and cancels. Stale download results are checked by session id and track id before loading. |
+| Some Bilibili resolves fail when WBI has no DASH audio | Resolver falls back to single-file `durl` media and tries legacy playurl when the primary playurl has no usable media; covered by `best_media_url_falls_back_when_primary_has_no_media`. |
+| Long video title overlaps player controls | Desktop player title truncates and scrolls long titles without expanding the transport layout. |
+| Empty chat has an extra framed empty panel | Desktop empty chat state uses a lightweight text-only style inside the message viewport. |
 | Peer connection overview | `FrontendEvent::Peers` carries UI-only route/direct-promotion snapshots; covered by `peer_views_report_routes_and_direct_promotion_counters`. |
 | Chat history cannot scroll | Message list has a scroll viewport with near-bottom auto-follow and latest jump behavior. |
 | Play and pause should be one button | Desktop transport has one state-driven play/pause button that maps to existing pause/resume commands. |
@@ -48,7 +56,7 @@ npm.cmd run build
 git diff --check
 ```
 
-Observed result: all commands passed. `cargo test --lib` currently runs 60
+Observed result: all commands passed. `cargo test --lib` currently runs 73
 tests.
 
 ## Still Requires Real Multi-Peer Evidence

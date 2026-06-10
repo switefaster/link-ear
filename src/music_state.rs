@@ -7,8 +7,8 @@ use tokio::time::Instant;
 #[cfg(test)]
 use crate::core::PlaybackTrack;
 use crate::core::{
-    ActiveVote, PlaybackState, QueueItem, QueueState, VoteAction, VoteProposal, VoteView,
-    format_duration_ms,
+    ActiveVote, PlaybackState, QueueItem, QueueState, VoteAction, VoteProposal,
+    VoteTerminalOutcome, VoteView, format_duration_ms,
 };
 
 #[derive(Debug, Clone)]
@@ -53,6 +53,18 @@ pub(crate) struct PlaybackStart {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct VoteInvalidation {
     pub(crate) reason: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum VoteCastOutcome {
+    Accepted { vote_id: String },
+    Duplicate { vote_id: String },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum VoteResolution {
+    Passed(VoteProposal),
+    Rejected(VoteProposal),
 }
 
 #[derive(Debug, Clone)]
@@ -481,7 +493,7 @@ impl MusicState {
 
     pub(crate) fn start_vote(&mut self, proposal: VoteProposal, deadline: Instant) {
         let mut vote = ActiveVote::new(proposal.clone(), deadline);
-        vote.vote(proposal.proposer.clone(), true);
+        let _ = vote.vote(proposal.proposer.clone(), true);
         self.active_vote = Some(vote);
     }
 
@@ -498,16 +510,19 @@ impl MusicState {
         }
 
         let mut vote = ActiveVote::new(proposal.clone(), deadline);
-        vote.vote(proposal.proposer.clone(), true);
+        let _ = vote.vote(proposal.proposer.clone(), true);
         self.active_vote = Some(vote);
         Ok(())
     }
 
-    pub(crate) fn cast_vote(&mut self, peer_id: String, approve: bool) -> Option<String> {
+    pub(crate) fn cast_vote(&mut self, peer_id: String, approve: bool) -> Option<VoteCastOutcome> {
         let vote = self.active_vote.as_mut()?;
         let vote_id = vote.proposal.vote_id.clone();
-        vote.vote(peer_id, approve);
-        Some(vote_id)
+        if vote.vote(peer_id, approve) {
+            Some(VoteCastOutcome::Accepted { vote_id })
+        } else {
+            Some(VoteCastOutcome::Duplicate { vote_id })
+        }
     }
 
     pub(crate) fn cast_vote_for(&mut self, vote_id: &str, peer_id: String, approve: bool) -> bool {
@@ -518,19 +533,31 @@ impl MusicState {
             return false;
         }
 
-        vote.vote(peer_id, approve);
-        true
+        vote.vote(peer_id, approve)
     }
 
-    pub(crate) fn resolve_vote(&mut self, threshold: usize) -> Option<VoteProposal> {
+    pub(crate) fn resolve_vote(
+        &mut self,
+        threshold: usize,
+        eligible_peers: usize,
+    ) -> Option<VoteResolution> {
         let vote = self.active_vote.as_ref()?;
-        if vote.approval_count() < threshold {
-            return None;
+        match vote.terminal_outcome(threshold, eligible_peers) {
+            VoteTerminalOutcome::Pending => None,
+            VoteTerminalOutcome::Passed
+                if self.ready_vote_waiting_for_queue(threshold).is_some() =>
+            {
+                None
+            }
+            VoteTerminalOutcome::Passed => self
+                .active_vote
+                .take()
+                .map(|vote| VoteResolution::Passed(vote.proposal)),
+            VoteTerminalOutcome::Rejected => self
+                .active_vote
+                .take()
+                .map(|vote| VoteResolution::Rejected(vote.proposal)),
         }
-        if self.ready_vote_waiting_for_queue(threshold).is_some() {
-            return None;
-        }
-        self.active_vote.take().map(|vote| vote.proposal)
     }
 
     pub(crate) fn ready_vote_waiting_for_queue(&self, threshold: usize) -> Option<VoteProposal> {
@@ -559,7 +586,12 @@ impl MusicState {
         }
     }
 
-    pub(crate) fn vote_view(&self, threshold: usize) -> Option<VoteView> {
+    pub(crate) fn vote_view(
+        &self,
+        threshold: usize,
+        eligible_peers: usize,
+        local_peer_id: &str,
+    ) -> Option<VoteView> {
         self.active_vote.as_ref().map(|vote| VoteView {
             vote_id: vote.proposal.vote_id.clone(),
             proposer: vote.proposal.proposer.clone(),
@@ -567,6 +599,9 @@ impl MusicState {
             approvals: vote.approvals.len(),
             rejections: vote.rejections.len(),
             threshold,
+            eligible_peers,
+            pending: vote.pending_count(eligible_peers),
+            local_vote: vote.local_vote(local_peer_id),
         })
     }
 
@@ -1182,14 +1217,17 @@ mod tests {
 
         let waiting = music.ready_vote_waiting_for_queue(2).unwrap();
         assert_eq!(waiting.queue_version, 2);
-        assert!(music.resolve_vote(2).is_none());
+        assert!(music.resolve_vote(2, 2).is_none());
 
         let outcome = music
             .apply_remote_queue_state(queue_state(2, 100, vec![queue_item("future")]))
             .unwrap();
         assert_eq!(outcome.invalidated_vote, None);
         assert!(music.ready_vote_waiting_for_queue(2).is_none());
-        assert!(music.resolve_vote(2).is_some());
+        assert!(matches!(
+            music.resolve_vote(2, 2),
+            Some(VoteResolution::Passed(_))
+        ));
     }
 
     #[test]
@@ -1278,6 +1316,64 @@ mod tests {
             music.active_vote.as_ref().map(ActiveVote::approval_count),
             Some(1)
         );
+    }
+
+    #[test]
+    fn duplicate_ballot_for_current_vote_is_ignored() {
+        let proposer = peer_id();
+        let voter = peer_id();
+        let mut music = MusicState::new();
+        music.start_vote(
+            proposal(proposer, VoteAction::Pause, 0),
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        assert!(music.cast_vote_for("vote-1", voter.to_string(), true));
+        assert!(!music.cast_vote_for("vote-1", voter.to_string(), false));
+
+        let vote = music.active_vote.as_ref().unwrap();
+        assert_eq!(vote.approval_count(), 2);
+        assert_eq!(vote.rejection_count(), 0);
+    }
+
+    #[test]
+    fn vote_resolution_rejects_when_majority_is_impossible() {
+        let proposer = peer_id();
+        let voter_one = peer_id();
+        let voter_two = peer_id();
+        let mut music = MusicState::new();
+        music.start_vote(
+            proposal(proposer, VoteAction::Pause, 0),
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        assert!(music.cast_vote_for("vote-1", voter_one.to_string(), false));
+        assert!(matches!(music.resolve_vote(2, 3), None));
+        assert!(music.cast_vote_for("vote-1", voter_two.to_string(), false));
+
+        assert!(matches!(
+            music.resolve_vote(2, 3),
+            Some(VoteResolution::Rejected(_))
+        ));
+        assert!(music.active_vote.is_none());
+    }
+
+    #[test]
+    fn vote_view_reports_pending_and_local_vote() {
+        let proposer = peer_id();
+        let voter = peer_id();
+        let mut music = MusicState::new();
+        music.start_vote(
+            proposal(proposer, VoteAction::Pause, 0),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(music.cast_vote_for("vote-1", voter.to_string(), false));
+
+        let view = music.vote_view(2, 4, &voter.to_string()).unwrap();
+        assert_eq!(view.approvals, 1);
+        assert_eq!(view.rejections, 1);
+        assert_eq!(view.pending, 2);
+        assert_eq!(view.local_vote, Some(false));
     }
 
     #[test]
