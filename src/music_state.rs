@@ -143,11 +143,9 @@ impl MusicState {
         self.queue_updated_at = updated_at_micros;
     }
 
-    pub(crate) fn insert_queue_item(&mut self, item: QueueItem, position: Option<usize>) -> usize {
-        let index = position
-            .map(|position| position.saturating_sub(1).min(self.queue.len()))
-            .unwrap_or(self.queue.len());
-        self.queue.insert(index, item);
+    pub(crate) fn append_queue_item(&mut self, item: QueueItem) -> usize {
+        let index = self.queue.len();
+        self.queue.push_back(item);
         index
     }
 
@@ -172,7 +170,7 @@ impl MusicState {
         self.queue = VecDeque::from(state.items.clone());
         self.queue_version = state.version;
         self.queue_updated_at = state.updated_at_micros;
-        let invalidated_vote = self.invalidate_queue_vote("queue changed during vote");
+        let invalidated_vote = self.invalidate_stale_queue_vote();
 
         Some(RemoteQueueApply {
             state,
@@ -361,13 +359,13 @@ impl MusicState {
         &mut self,
         state: PlaybackState,
     ) -> Option<VoteInvalidation> {
-        let invalidated = self.invalidate_playback_vote("playback changed during vote");
+        let invalidated = self.invalidate_playback_vote_if_track_changes(&state);
         self.playback_phase = PlaybackPhase::Preparing(PreparingPlayback::follower(state));
         invalidated
     }
 
     pub(crate) fn set_playback_state(&mut self, state: PlaybackState) -> Option<VoteInvalidation> {
-        let invalidated = self.invalidate_playback_vote("playback changed during vote");
+        let invalidated = self.invalidate_playback_vote_if_track_changes(&state);
         if state.track.is_some() {
             self.playback_phase = PlaybackPhase::Active(state);
         } else {
@@ -464,6 +462,10 @@ impl MusicState {
         })
     }
 
+    pub(crate) fn mark_queue_vote_applied(&mut self, updated_at_micros: i64) {
+        self.mark_queue_changed(updated_at_micros);
+    }
+
     fn update_playback_state(
         &mut self,
         _now_micros: i64,
@@ -525,7 +527,24 @@ impl MusicState {
         if vote.approval_count() < threshold {
             return None;
         }
+        if self.ready_vote_waiting_for_queue(threshold).is_some() {
+            return None;
+        }
         self.active_vote.take().map(|vote| vote.proposal)
+    }
+
+    pub(crate) fn ready_vote_waiting_for_queue(&self, threshold: usize) -> Option<VoteProposal> {
+        let vote = self.active_vote.as_ref()?;
+        if vote.approval_count() < threshold {
+            return None;
+        }
+        matches!(
+            vote.proposal.action,
+            VoteAction::Remove { .. } | VoteAction::Move { .. }
+        )
+        .then_some(())
+        .filter(|_| vote.proposal.queue_version > self.queue_version)
+        .map(|_| vote.proposal.clone())
     }
 
     pub(crate) fn take_timed_out_vote(&mut self, now: Instant) -> Option<ActiveVote> {
@@ -554,17 +573,23 @@ impl MusicState {
     pub(crate) fn stale_vote_reason(&self, proposal: &VoteProposal) -> Option<&'static str> {
         match &proposal.action {
             VoteAction::Remove { item_id } | VoteAction::Move { item_id, .. } => {
-                if proposal.queue_version != self.queue_version {
+                if proposal.queue_version < self.queue_version {
                     return Some("queue changed during vote");
                 }
-                (!self.queue.iter().any(|item| item.item_id == *item_id))
-                    .then_some("queue item is no longer available")
+                if proposal.queue_version == self.queue_version {
+                    return (!self.queue.iter().any(|item| item.item_id == *item_id))
+                        .then_some("queue item is no longer available");
+                }
+                None
             }
             VoteAction::Pause | VoteAction::Resume | VoteAction::Skip | VoteAction::Seek { .. } => {
                 let current_session = self
                     .playback_state()
                     .and_then(|state| state.track.as_ref().map(|_| state.session_id.as_str()));
-                (proposal.playback_session_id.as_deref() != current_session)
+                let Some(current_session) = current_session else {
+                    return Some("no active playback");
+                };
+                (proposal.playback_session_id.as_deref() != Some(current_session))
                     .then_some("playback changed during vote")
             }
         }
@@ -575,33 +600,24 @@ impl MusicState {
         proposal: &VoteProposal,
         local_peer_id: PeerId,
     ) -> bool {
-        match &proposal.action {
-            VoteAction::Remove { .. } | VoteAction::Move { .. } => {
-                proposal.proposer == local_peer_id.to_string()
-            }
-            VoteAction::Pause | VoteAction::Resume | VoteAction::Skip | VoteAction::Seek { .. } => {
-                self.playback_state()
-                    .is_some_and(|state| can_control_playback(state, local_peer_id))
-            }
-        }
+        let _ = local_peer_id;
+        self.stale_vote_reason(proposal).is_none()
     }
 
-    pub(crate) fn invalidate_queue_vote(
-        &mut self,
-        reason: &'static str,
-    ) -> Option<VoteInvalidation> {
-        let should_invalidate = self.active_vote.as_ref().is_some_and(|vote| {
+    fn invalidate_stale_queue_vote(&mut self) -> Option<VoteInvalidation> {
+        let reason = self.active_vote.as_ref().and_then(|vote| {
             matches!(
                 vote.proposal.action,
                 VoteAction::Remove { .. } | VoteAction::Move { .. }
             )
+            .then(|| self.stale_vote_reason(&vote.proposal))
+            .flatten()
         });
-        if should_invalidate {
+
+        reason.map(|reason| {
             self.active_vote.take();
-            Some(VoteInvalidation { reason })
-        } else {
-            None
-        }
+            VoteInvalidation { reason }
+        })
     }
 
     pub(crate) fn invalidate_playback_vote(
@@ -621,6 +637,30 @@ impl MusicState {
             None
         }
     }
+
+    fn invalidate_playback_vote_if_track_changes(
+        &mut self,
+        next: &PlaybackState,
+    ) -> Option<VoteInvalidation> {
+        let should_invalidate = self.active_vote.as_ref().is_some_and(|vote| {
+            matches!(
+                vote.proposal.action,
+                VoteAction::Pause | VoteAction::Resume | VoteAction::Skip | VoteAction::Seek { .. }
+            ) && self.playback_track_key() != playback_track_key(next)
+        });
+        if should_invalidate {
+            self.active_vote.take();
+            Some(VoteInvalidation {
+                reason: "playback changed during vote",
+            })
+        } else {
+            None
+        }
+    }
+
+    fn playback_track_key(&self) -> Option<(&str, &str)> {
+        self.playback_state().and_then(playback_track_key)
+    }
 }
 
 pub(crate) fn majority_threshold(total_peers: usize) -> usize {
@@ -632,6 +672,13 @@ pub(crate) fn can_control_playback(state: &PlaybackState, local_peer_id: PeerId)
         .track_requested_by
         .as_ref()
         .is_some_and(|requester| requester == &local_peer_id.to_string())
+}
+
+fn playback_track_key(state: &PlaybackState) -> Option<(&str, &str)> {
+    state
+        .track
+        .as_ref()
+        .map(|track| (state.session_id.as_str(), track.track_id.as_str()))
 }
 
 pub(crate) fn queue_item_at(queue: &VecDeque<QueueItem>, index: usize) -> Option<&QueueItem> {
@@ -957,6 +1004,31 @@ mod tests {
     }
 
     #[test]
+    fn remote_queue_update_keeps_future_vote_when_context_arrives() {
+        let proposer = peer_id();
+        let mut music = MusicState::new();
+        music.queue_version = 1;
+        music.start_vote(
+            proposal(
+                proposer,
+                VoteAction::Move {
+                    item_id: "future".to_string(),
+                    to_index: 0,
+                },
+                2,
+            ),
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        let outcome = music
+            .apply_remote_queue_state(queue_state(2, 100, vec![queue_item("future")]))
+            .unwrap();
+
+        assert_eq!(outcome.invalidated_vote, None);
+        assert!(music.active_vote.is_some());
+    }
+
+    #[test]
     fn remote_playback_update_invalidates_playback_vote() {
         let local = peer_id();
         let mut music = MusicState::new();
@@ -989,6 +1061,60 @@ mod tests {
     }
 
     #[test]
+    fn same_session_playback_update_keeps_playback_vote() {
+        let local = peer_id();
+        let mut music = MusicState::new();
+        music.playback_phase = PlaybackPhase::Active(playback_state(
+            local, local, "session", true, 0, 1_000_000, 10_000,
+        ));
+        music.start_vote(
+            proposal(local, VoteAction::Pause, 0),
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        let invalidated = music.set_playback_state(playback_state(
+            local, local, "session", true, 2_000, 2_000_000, 10_000,
+        ));
+
+        assert_eq!(invalidated, None);
+        assert!(music.active_vote.is_some());
+    }
+
+    #[test]
+    fn playback_vote_without_active_track_is_stale() {
+        let proposer = peer_id();
+        let music = MusicState::new();
+        let proposal = VoteProposal {
+            playback_session_id: None,
+            ..proposal(proposer, VoteAction::Pause, 0)
+        };
+
+        assert_eq!(
+            music.stale_vote_reason(&proposal),
+            Some("no active playback")
+        );
+    }
+
+    #[test]
+    fn passed_vote_is_executable_by_all_room_peers() {
+        let proposer = peer_id();
+        let other = peer_id();
+        let mut music = MusicState::new();
+        music.queue.push_back(queue_item("current"));
+        music.queue_version = 1;
+
+        let proposal = proposal(
+            proposer,
+            VoteAction::Remove {
+                item_id: "current".to_string(),
+            },
+            1,
+        );
+
+        assert!(music.should_execute_vote_locally(&proposal, other));
+    }
+
+    #[test]
     fn stale_vote_proposal_is_rejected_on_receipt() {
         let proposer = peer_id();
         let mut music = MusicState::new();
@@ -1010,6 +1136,60 @@ mod tests {
 
         assert_eq!(err, "queue changed during vote");
         assert!(music.active_vote.is_none());
+    }
+
+    #[test]
+    fn future_queue_vote_proposal_is_accepted_while_waiting_for_sync() {
+        let proposer = peer_id();
+        let mut music = MusicState::new();
+        music.queue_version = 1;
+
+        music
+            .receive_vote_proposal(
+                proposal(
+                    proposer,
+                    VoteAction::Move {
+                        item_id: "future-item".to_string(),
+                        to_index: 0,
+                    },
+                    2,
+                ),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert!(music.active_vote.is_some());
+    }
+
+    #[test]
+    fn passed_future_queue_vote_waits_until_queue_catches_up() {
+        let proposer = peer_id();
+        let voter = peer_id();
+        let mut music = MusicState::new();
+        music.queue_version = 1;
+        music.start_vote(
+            proposal(
+                proposer,
+                VoteAction::Move {
+                    item_id: "future".to_string(),
+                    to_index: 0,
+                },
+                2,
+            ),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(music.cast_vote_for("vote-1", voter.to_string(), true));
+
+        let waiting = music.ready_vote_waiting_for_queue(2).unwrap();
+        assert_eq!(waiting.queue_version, 2);
+        assert!(music.resolve_vote(2).is_none());
+
+        let outcome = music
+            .apply_remote_queue_state(queue_state(2, 100, vec![queue_item("future")]))
+            .unwrap();
+        assert_eq!(outcome.invalidated_vote, None);
+        assert!(music.ready_vote_waiting_for_queue(2).is_none());
+        assert!(music.resolve_vote(2).is_some());
     }
 
     #[test]

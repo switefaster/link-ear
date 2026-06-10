@@ -109,6 +109,21 @@ pub struct VoteView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConnectionView {
+    pub peer_id: String,
+    pub kind: String,
+    pub route: String,
+    pub direct_connections: usize,
+    pub relayed_connections: usize,
+    pub direct_address_count: usize,
+    pub chat_subscribed: bool,
+    pub direct_promotion_attempts: u32,
+    pub direct_promotion_failures: u32,
+    pub direct_promotion_in_flight: bool,
+    pub direct_promotion_suspended: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum FrontendEvent {
     Status(String),
@@ -118,6 +133,7 @@ pub enum FrontendEvent {
     Playback(Option<PlaybackView>),
     Queue(QueueState),
     Vote(Option<VoteView>),
+    Peers(Vec<PeerConnectionView>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +255,7 @@ pub enum NetworkCommand {
     Pause,
     Resume,
     Seek(u64),
+    SetVolume(u8),
     Skip,
     RemoveQueueItem(usize),
     MoveQueueItem {

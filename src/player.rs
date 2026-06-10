@@ -29,6 +29,7 @@ pub struct AudioPlayer {
     position_ms: u64,
     started_at_micros: i64,
     playing: bool,
+    volume: f32,
 }
 
 #[derive(Clone)]
@@ -59,6 +60,7 @@ impl AudioPlayer {
             position_ms: 0,
             started_at_micros: 0,
             playing: false,
+            volume: volume_percent_to_gain(100),
         })
     }
 
@@ -93,6 +95,20 @@ impl AudioPlayer {
 
     pub fn is_playing(&self) -> bool {
         self.playing
+    }
+
+    pub fn set_volume(&mut self, percent: u8, now_micros: i64) -> Result<()> {
+        let gain = volume_percent_to_gain(percent);
+        if (self.volume - gain).abs() < f32::EPSILON {
+            return Ok(());
+        }
+
+        self.volume = gain;
+        if self.audio.is_some() {
+            let position_ms = self.position_ms(now_micros);
+            self.restart(position_ms, self.playing, now_micros)?;
+        }
+        Ok(())
     }
 
     pub fn stop(&mut self) {
@@ -187,7 +203,7 @@ impl AudioPlayer {
     }
 
     fn build_sink(&self, audio: DecodedAudio, position_ms: u64, playing: bool) -> Result<Player> {
-        let source = PcmSource::new(audio, position_ms);
+        let source = PcmSource::new(audio, position_ms).amplify(self.volume);
         let sink = Player::connect_new(self.stream.mixer());
         sink.append(source);
 
@@ -209,6 +225,10 @@ impl AudioPlayer {
 
 fn open_default_output() -> Result<MixerDeviceSink> {
     DeviceSinkBuilder::open_default_sink().context("failed to open default audio output")
+}
+
+pub fn volume_percent_to_gain(percent: u8) -> f32 {
+    (percent.min(100) as f32) / 100.0
 }
 
 impl DecodedAudio {
@@ -416,4 +436,16 @@ fn decode_audio(audio: Arc<[u8]>) -> Result<DecodedAudio> {
         channels: channels.ok_or_else(|| anyhow!("decoded audio has no channel info"))?,
         sample_rate: sample_rate.ok_or_else(|| anyhow!("decoded audio has no sample rate"))?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_percent_to_gain_maps_ui_range() {
+        assert_eq!(volume_percent_to_gain(0), 0.0);
+        assert_eq!(volume_percent_to_gain(50), 0.5);
+        assert_eq!(volume_percent_to_gain(100), 1.0);
+    }
 }

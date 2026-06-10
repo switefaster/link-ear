@@ -1,8 +1,12 @@
+use std::{error::Error, fmt};
+
 use anyhow::{Context, Result, anyhow, bail};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{
-    Client,
-    header::{HeaderMap, HeaderValue, REFERER, USER_AGENT},
+    Client, StatusCode,
+    header::{
+        ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderValue, PRAGMA, REFERER, USER_AGENT,
+    },
 };
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -16,6 +20,9 @@ const MIXIN_KEY_ENC_TAB: [usize; 64] = [
 
 const BILIBILI_API: &str = "https://api.bilibili.com/x";
 const BILIBILI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
+const BILIBILI_ORIGIN: &str = "https://www.bilibili.com";
+const BILIBILI_API_ACCEPT: &str = "application/json, text/plain, */*";
+const BILIBILI_MEDIA_ACCEPT: &str = "*/*";
 
 #[derive(Debug, Deserialize)]
 struct BilibiliResult<T> {
@@ -51,6 +58,7 @@ struct BilibiliWbiInfo {
 #[derive(Debug, Deserialize)]
 struct BilibiliPlayerInfo {
     dash: Option<BilibiliDash>,
+    durl: Option<Vec<BilibiliDurl>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +76,14 @@ struct BilibiliAudio {
     base_url_snake: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BilibiliDurl {
+    order: u64,
+    size: Option<u64>,
+    url: String,
+    backup_url: Option<Vec<String>>,
+}
+
 impl BilibiliAudio {
     fn base_url(&self) -> Option<&str> {
         self.base_url_camel
@@ -80,15 +96,23 @@ impl BilibiliAudio {
     }
 }
 
+impl BilibiliDurl {
+    fn quality_key(&self) -> (u64, u64) {
+        (self.size.unwrap_or(0), u64::MAX.saturating_sub(self.order))
+    }
+}
+
 pub fn client() -> Result<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(BILIBILI_UA));
-    headers.insert(
-        "accept-language",
-        HeaderValue::from_static("zh-CN,zh;q=0.9"),
-    );
-    headers.insert("cache-control", HeaderValue::from_static("no-cache"));
-    headers.insert("pragma", HeaderValue::from_static("no-cache"));
+    headers.insert(ACCEPT, HeaderValue::from_static(BILIBILI_API_ACCEPT));
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("zh-CN,zh;q=0.9"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert("origin", HeaderValue::from_static(BILIBILI_ORIGIN));
+    headers.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
+    headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
+    headers.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
 
     Client::builder()
         .default_headers(headers)
@@ -101,24 +125,67 @@ pub async fn resolve_track(
     bvid: &str,
     part_index: usize,
 ) -> Result<PlaybackTrack> {
-    let referer = format!("https://www.bilibili.com/video/{bvid}");
-    let video = client
-        .get(format!("{BILIBILI_API}/web-interface/view"))
-        .query(&[("bvid", bvid)])
-        .header(REFERER, referer.as_str())
-        .send()
-        .await?
-        .read_result::<BilibiliVideoInfo>("video info")
-        .await?;
+    let referer = video_referer(bvid);
+    let video = bilibili_api_get(
+        client,
+        format!("{BILIBILI_API}/web-interface/view"),
+        &referer,
+    )
+    .query(&[("bvid", bvid)])
+    .send()
+    .await?
+    .read_result::<BilibiliVideoInfo>("video info")
+    .await?;
 
     let page = video
         .pages
         .get(part_index)
         .ok_or_else(|| anyhow!("part {} does not exist", part_index + 1))?;
 
-    let nav = client
-        .get(format!("{BILIBILI_API}/web-interface/nav"))
-        .header(REFERER, "https://www.bilibili.com/")
+    let player = resolve_player_info(client, bvid, page.cid, &referer).await?;
+
+    let media_url = best_media_url(player)?;
+
+    Ok(PlaybackTrack {
+        track_id: format!("bilibili:{bvid}:{}:{}", part_index + 1, page.cid),
+        title: format!("{} - {}", video.title, page.part),
+        source_kind: "bilibili".to_string(),
+        bvid: bvid.to_string(),
+        part: part_index + 1,
+        duration_ms: page.duration.saturating_mul(1000),
+        audio_url: media_url,
+        referer,
+    })
+}
+
+async fn resolve_player_info(
+    client: &Client,
+    bvid: &str,
+    cid: u64,
+    referer: &str,
+) -> Result<BilibiliPlayerInfo> {
+    match resolve_player_info_wbi(client, bvid, cid, referer).await {
+        Ok(player) => Ok(player),
+        Err(err) if is_http_precondition_failed(&err) => {
+            resolve_player_info_legacy(client, bvid, cid, referer)
+                .await
+                .with_context(|| {
+                    format!(
+                        "WBI playurl returned HTTP 412 and legacy playurl fallback failed: {err:#}"
+                    )
+                })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn resolve_player_info_wbi(
+    client: &Client,
+    bvid: &str,
+    cid: u64,
+    referer: &str,
+) -> Result<BilibiliPlayerInfo> {
+    let nav = bilibili_api_get(client, format!("{BILIBILI_API}/web-interface/nav"), referer)
         .send()
         .await?
         .read_result::<BilibiliNavInfo>("nav")
@@ -128,50 +195,97 @@ pub async fn resolve_track(
     let query = signed_query(
         [
             ("bvid", bvid.to_string()),
-            ("cid", page.cid.to_string()),
+            ("cid", cid.to_string()),
+            ("fnver", "0".to_string()),
             ("fnval", "16".to_string()),
+            ("fourk", "1".to_string()),
+            ("platform", "html5".to_string()),
             ("wts", wts.to_string()),
         ],
         &mixin_key(&nav.wbi_img)?,
     );
 
-    let player = client
-        .get(format!("{BILIBILI_API}/player/wbi/playurl?{query}"))
-        .header(REFERER, referer.as_str())
+    bilibili_api_get(
+        client,
+        format!("{BILIBILI_API}/player/wbi/playurl?{query}"),
+        referer,
+    )
+    .send()
+    .await?
+    .read_result::<BilibiliPlayerInfo>("play url")
+    .await
+}
+
+async fn resolve_player_info_legacy(
+    client: &Client,
+    bvid: &str,
+    cid: u64,
+    referer: &str,
+) -> Result<BilibiliPlayerInfo> {
+    bilibili_api_get(client, format!("{BILIBILI_API}/player/playurl"), referer)
+        .query(&[
+            ("bvid", bvid.to_string()),
+            ("cid", cid.to_string()),
+            ("fnver", "0".to_string()),
+            ("fnval", "16".to_string()),
+            ("fourk", "1".to_string()),
+            ("platform", "html5".to_string()),
+            ("qn", "64".to_string()),
+        ])
         .send()
         .await?
-        .read_result::<BilibiliPlayerInfo>("play url")
-        .await?;
+        .read_result::<BilibiliPlayerInfo>("legacy play url")
+        .await
+}
 
-    let audio = player
-        .dash
-        .ok_or_else(|| anyhow!("dash audio does not exist"))?
-        .audio
-        .ok_or_else(|| anyhow!("dash audio does not exist"))?
-        .into_iter()
-        .filter_map(|audio| {
-            let base_url = audio.base_url()?;
-            Some((audio.quality_key(), base_url.to_string()))
-        })
-        .max_by_key(|(quality, _)| *quality)
-        .ok_or_else(|| anyhow!("audio stream does not exist"))?;
+fn best_media_url(player: BilibiliPlayerInfo) -> Result<String> {
+    if let Some(audio) = player.dash.and_then(|dash| dash.audio) {
+        if let Some((_, url)) = audio
+            .into_iter()
+            .filter_map(|audio| {
+                let base_url = audio.base_url()?;
+                Some((audio.quality_key(), base_url.to_string()))
+            })
+            .max_by_key(|(quality, _)| *quality)
+        {
+            return Ok(url);
+        }
+    }
 
-    Ok(PlaybackTrack {
-        track_id: format!("bilibili:{bvid}:{}:{}", part_index + 1, page.cid),
-        title: format!("{} - {}", video.title, page.part),
-        source_kind: "bilibili".to_string(),
-        bvid: bvid.to_string(),
-        part: part_index + 1,
-        duration_ms: page.duration.saturating_mul(1000),
-        audio_url: audio.1,
-        referer,
-    })
+    if let Some(durls) = player.durl {
+        if durls.len() > 1 {
+            bail!("segmented bilibili durl streams are not supported yet");
+        }
+        if let Some((_, url)) = durls
+            .into_iter()
+            .map(|durl| {
+                let quality = durl.quality_key();
+                let url = if durl.url.is_empty() {
+                    durl.backup_url
+                        .and_then(|mut backup_urls| backup_urls.pop())
+                        .unwrap_or_default()
+                } else {
+                    durl.url
+                };
+                (quality, url)
+            })
+            .filter(|(_, url)| !url.is_empty())
+            .max_by_key(|(quality, _)| *quality)
+        {
+            return Ok(url);
+        }
+    }
+
+    bail!("bilibili media stream does not exist")
 }
 
 pub async fn download_audio(client: &Client, track: &PlaybackTrack) -> Result<Vec<u8>> {
     let response = client
         .get(&track.audio_url)
+        .header(ACCEPT, BILIBILI_MEDIA_ACCEPT)
         .header(REFERER, track.referer.as_str())
+        .header("origin", BILIBILI_ORIGIN)
+        .header("range", "bytes=0-")
         .send()
         .await?
         .error_for_status()?;
@@ -185,17 +299,43 @@ trait BilibiliResponseExt {
         T: DeserializeOwned;
 }
 
+#[derive(Debug)]
+struct BilibiliHttpStatusError {
+    endpoint: &'static str,
+    status: StatusCode,
+    body_preview: String,
+}
+
+impl fmt::Display for BilibiliHttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "bilibili {} request failed with HTTP {}: {}",
+            self.endpoint, self.status, self.body_preview
+        )
+    }
+}
+
+impl Error for BilibiliHttpStatusError {}
+
 impl BilibiliResponseExt for reqwest::Response {
     async fn read_result<T>(self, endpoint: &'static str) -> Result<T>
     where
         T: DeserializeOwned,
     {
+        let status = self.status();
         let body = self
-            .error_for_status()
-            .with_context(|| format!("bilibili {endpoint} request failed"))?
             .text()
             .await
             .with_context(|| format!("failed to read bilibili {endpoint} response"))?;
+        if !status.is_success() {
+            return Err(BilibiliHttpStatusError {
+                endpoint,
+                status,
+                body_preview: preview_body(&body),
+            }
+            .into());
+        }
 
         let result = serde_json::from_str::<BilibiliResult<T>>(&body).with_context(|| {
             format!(
@@ -218,6 +358,30 @@ impl BilibiliResponseExt for reqwest::Response {
 
         bail!("bilibili {endpoint} returned no data")
     }
+}
+
+fn bilibili_api_get(
+    client: &Client,
+    url: impl reqwest::IntoUrl,
+    referer: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .header(ACCEPT, BILIBILI_API_ACCEPT)
+        .header(REFERER, referer)
+        .header("origin", BILIBILI_ORIGIN)
+}
+
+fn video_referer(bvid: &str) -> String {
+    format!("https://www.bilibili.com/video/{bvid}/")
+}
+
+fn is_http_precondition_failed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<BilibiliHttpStatusError>()
+            .is_some_and(|error| error.status == StatusCode::PRECONDITION_FAILED)
+    })
 }
 
 fn preview_body(body: &str) -> String {
@@ -330,5 +494,99 @@ mod tests {
                 mixin,
             )
         );
+    }
+
+    #[test]
+    fn video_referer_uses_browser_video_page() {
+        assert_eq!(
+            video_referer("BV1xx411c7mD"),
+            "https://www.bilibili.com/video/BV1xx411c7mD/"
+        );
+    }
+
+    #[test]
+    fn http_412_errors_are_detected_for_fallback() {
+        let error: anyhow::Error = BilibiliHttpStatusError {
+            endpoint: "play url",
+            status: StatusCode::PRECONDITION_FAILED,
+            body_preview: "blocked".to_string(),
+        }
+        .into();
+
+        assert!(is_http_precondition_failed(&error));
+    }
+
+    #[test]
+    fn best_media_url_prefers_dash_audio() {
+        let player = BilibiliPlayerInfo {
+            dash: Some(BilibiliDash {
+                audio: Some(vec![
+                    BilibiliAudio {
+                        id: 30216,
+                        bandwidth: Some(64),
+                        base_url_camel: Some("https://example.test/low.m4s".to_string()),
+                        base_url_snake: None,
+                    },
+                    BilibiliAudio {
+                        id: 30280,
+                        bandwidth: Some(128),
+                        base_url_camel: None,
+                        base_url_snake: Some("https://example.test/high.m4s".to_string()),
+                    },
+                ]),
+            }),
+            durl: Some(vec![BilibiliDurl {
+                order: 1,
+                size: Some(10_000),
+                url: "https://example.test/fallback.mp4".to_string(),
+                backup_url: None,
+            }]),
+        };
+
+        assert_eq!(
+            best_media_url(player).unwrap(),
+            "https://example.test/high.m4s"
+        );
+    }
+
+    #[test]
+    fn best_media_url_uses_single_durl_when_dash_audio_is_missing() {
+        let player = BilibiliPlayerInfo {
+            dash: None,
+            durl: Some(vec![BilibiliDurl {
+                order: 1,
+                size: Some(5_880_463),
+                url: "https://example.test/video.mp4".to_string(),
+                backup_url: Some(vec!["https://example.test/backup.mp4".to_string()]),
+            }]),
+        };
+
+        assert_eq!(
+            best_media_url(player).unwrap(),
+            "https://example.test/video.mp4"
+        );
+    }
+
+    #[test]
+    fn best_media_url_rejects_segmented_durl() {
+        let player = BilibiliPlayerInfo {
+            dash: None,
+            durl: Some(vec![
+                BilibiliDurl {
+                    order: 1,
+                    size: Some(1),
+                    url: "https://example.test/part1.mp4".to_string(),
+                    backup_url: None,
+                },
+                BilibiliDurl {
+                    order: 2,
+                    size: Some(1),
+                    url: "https://example.test/part2.mp4".to_string(),
+                    backup_url: None,
+                },
+            ]),
+        };
+
+        assert!(best_media_url(player).is_err());
     }
 }

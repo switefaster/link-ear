@@ -124,6 +124,11 @@ async fn seek(state: State<'_, BackendState>, seconds: u64) -> Result<(), String
 }
 
 #[tauri::command]
+async fn set_volume(state: State<'_, BackendState>, percent: u8) -> Result<(), String> {
+    send_command(&state, NetworkCommand::SetVolume(percent)).await
+}
+
+#[tauri::command]
 async fn skip(state: State<'_, BackendState>) -> Result<(), String> {
     send_command(&state, NetworkCommand::Skip).await
 }
@@ -187,6 +192,7 @@ fn main() {
             pause,
             resume,
             seek,
+            set_volume,
             skip,
             remove_queue_item,
             move_queue_item,

@@ -4,6 +4,8 @@ use std::time::Duration;
 use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
 use tokio::time::Instant;
 
+use crate::core::PeerConnectionView;
+
 pub(crate) const DIRECT_PROMOTION_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const DIRECT_PROMOTION_MEDIUM_RETRY_INTERVAL: Duration = Duration::from_secs(120);
 pub(crate) const DIRECT_PROMOTION_SLOW_RETRY_INTERVAL: Duration = Duration::from_secs(600);
@@ -13,11 +15,11 @@ pub(crate) const DIRECT_PROMOTION_MAX_FAILURES: u32 = 10;
 pub(crate) const DIRECT_PROMOTION_FAILURE_DEDUP_WINDOW: Duration = Duration::from_secs(5);
 pub(crate) const GOSSIP_WARMUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const GOSSIP_WARMUP_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const DIRECT_RELAY_HANDOFF_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum RelayCloseReason {
-    DirectPromotion,
-    ChatReady,
+    HandoffSettled,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -83,10 +85,19 @@ impl PeerConnectionRoutes {
     pub(crate) fn relayed_connections(&self) -> Vec<ConnectionId> {
         self.relayed.iter().copied().collect()
     }
+
+    fn direct_count(&self) -> usize {
+        self.direct.len()
+    }
+
+    fn relayed_count(&self) -> usize {
+        self.relayed.len()
+    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct DirectPromotionBackoff {
+    pub(crate) attempts: u32,
     pub(crate) failures: u32,
     last_attempt: Option<Instant>,
     last_failure: Option<Instant>,
@@ -118,6 +129,7 @@ impl DirectPromotionBackoff {
     }
 
     fn mark_attempt(&mut self, now: Instant) {
+        self.attempts = self.attempts.saturating_add(1);
         self.last_attempt = Some(now);
         self.in_flight = true;
     }
@@ -174,6 +186,7 @@ pub(crate) struct ConnectionState {
     backoffs: HashMap<PeerId, DirectPromotionBackoff>,
     warmups: HashMap<PeerId, GossipsubWarmup>,
     warmup_completed: HashSet<PeerId>,
+    relay_handoffs: HashMap<PeerId, Instant>,
     chat_subscribers: HashSet<PeerId>,
     gossip_peers: HashSet<PeerId>,
 }
@@ -187,6 +200,7 @@ impl ConnectionState {
             backoffs: HashMap::new(),
             warmups: HashMap::new(),
             warmup_completed: HashSet::new(),
+            relay_handoffs: HashMap::new(),
             chat_subscribers: HashSet::new(),
             gossip_peers: HashSet::new(),
         }
@@ -194,6 +208,75 @@ impl ConnectionState {
 
     pub(crate) fn routes(&self) -> &HashMap<PeerId, PeerConnectionRoutes> {
         &self.routes
+    }
+
+    pub(crate) fn peer_views(&self, rendezvous_nodes: &HashSet<PeerId>) -> Vec<PeerConnectionView> {
+        let mut peer_ids = HashSet::new();
+        peer_ids.extend(self.routes.keys().copied());
+        peer_ids.extend(self.direct_addresses.keys().copied());
+        peer_ids.extend(self.backoffs.keys().copied());
+        peer_ids.extend(self.chat_subscribers.iter().copied());
+        peer_ids.extend(rendezvous_nodes.iter().copied());
+        peer_ids.remove(&self.local_peer_id);
+
+        let mut views = peer_ids
+            .into_iter()
+            .map(|peer_id| {
+                let routes = self.routes.get(&peer_id);
+                let direct_connections = routes
+                    .map(PeerConnectionRoutes::direct_count)
+                    .unwrap_or_default();
+                let relayed_connections = routes
+                    .map(PeerConnectionRoutes::relayed_count)
+                    .unwrap_or_default();
+                let route = match (direct_connections > 0, relayed_connections > 0) {
+                    (true, true) => "direct+relay",
+                    (true, false) => "direct",
+                    (false, true) => "relay",
+                    (false, false) => "known",
+                }
+                .to_string();
+                let backoff = self.backoffs.get(&peer_id);
+
+                PeerConnectionView {
+                    peer_id: peer_id.to_string(),
+                    kind: if rendezvous_nodes.contains(&peer_id) {
+                        "rendezvous".to_string()
+                    } else {
+                        "room".to_string()
+                    },
+                    route,
+                    direct_connections,
+                    relayed_connections,
+                    direct_address_count: self
+                        .direct_addresses
+                        .get(&peer_id)
+                        .map(HashSet::len)
+                        .unwrap_or_default(),
+                    chat_subscribed: self.chat_subscribers.contains(&peer_id),
+                    direct_promotion_attempts: backoff
+                        .map(|backoff| backoff.attempts)
+                        .unwrap_or_default(),
+                    direct_promotion_failures: backoff
+                        .map(|backoff| backoff.failures)
+                        .unwrap_or_default(),
+                    direct_promotion_in_flight: backoff
+                        .map(|backoff| backoff.in_flight)
+                        .unwrap_or_default(),
+                    direct_promotion_suspended: backoff
+                        .map(|backoff| backoff.failures >= DIRECT_PROMOTION_MAX_FAILURES)
+                        .unwrap_or_default(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        views.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.route.cmp(&right.route))
+                .then_with(|| left.peer_id.cmp(&right.peer_id))
+        });
+        views
     }
 
     #[cfg(test)]
@@ -265,17 +348,12 @@ impl ConnectionState {
         if promotion_allowed {
             effects.extend(self.reset_backoff(peer_id));
             if self.is_chat_subscribed(peer_id) {
-                let relay_connections = self.relay_connections(peer_id);
-                if relay_connections.is_empty() {
+                if self.has_relayed(peer_id) {
+                    self.schedule_relay_handoff(peer_id, now, &mut effects);
+                } else {
                     effects.push(ConnectionEffect::Status(format!(
                         "connected {peer_id} directly"
                     )));
-                } else {
-                    effects.push(ConnectionEffect::CloseRelayConnections {
-                        peer_id,
-                        connection_ids: relay_connections,
-                        reason: RelayCloseReason::DirectPromotion,
-                    });
                 }
             } else if has_relayed_route {
                 effects.push(ConnectionEffect::Status(format!(
@@ -309,6 +387,9 @@ impl ConnectionState {
                 self.routes.remove(&peer_id);
             }
         }
+        if !self.has_direct(peer_id) || !self.has_relayed(peer_id) {
+            self.relay_handoffs.remove(&peer_id);
+        }
 
         let mut effects = Vec::new();
         if remaining_established > 0 {
@@ -321,6 +402,7 @@ impl ConnectionState {
             self.chat_subscribers.remove(&peer_id);
             self.warmups.remove(&peer_id);
             self.warmup_completed.remove(&peer_id);
+            self.relay_handoffs.remove(&peer_id);
             effects.push(ConnectionEffect::Status(format!("disconnected {peer_id}")));
             effects.extend(self.untrack_gossip_peer(peer_id));
         }
@@ -399,20 +481,20 @@ impl ConnectionState {
         self.maybe_promote_relayed_peer(peer_id, now, &mut effects);
 
         if self.has_direct(peer_id) {
-            let relay_connections = self.relay_connections(peer_id);
-            if !relay_connections.is_empty() {
-                effects.push(ConnectionEffect::CloseRelayConnections {
-                    peer_id,
-                    connection_ids: relay_connections,
-                    reason: RelayCloseReason::ChatReady,
-                });
-            }
+            self.schedule_relay_handoff(peer_id, now, &mut effects);
         }
 
         effects
     }
 
     pub(crate) fn chat_unsubscribed(&mut self, peer_id: PeerId) -> Vec<ConnectionEffect> {
+        if self.routes.contains_key(&peer_id) {
+            self.relay_handoffs.remove(&peer_id);
+            return vec![ConnectionEffect::Status(format!(
+                "peer {peer_id} chat unsubscribe observed while still connected; keeping readiness until disconnect"
+            ))];
+        }
+
         self.chat_subscribers.remove(&peer_id);
         vec![ConnectionEffect::Status(format!(
             "peer {peer_id} unsubscribed from chat"
@@ -434,10 +516,18 @@ impl ConnectionState {
             .iter()
             .filter_map(|(peer_id, warmup)| warmup.is_expired(now).then_some(*peer_id))
             .collect::<Vec<_>>();
+        let handoffs = self
+            .relay_handoffs
+            .iter()
+            .filter_map(|(peer_id, deadline)| (*deadline <= now).then_some(*peer_id))
+            .collect::<Vec<_>>();
 
         let mut effects = Vec::new();
         for peer_id in peers {
             self.maybe_promote_relayed_peer(peer_id, now, &mut effects);
+        }
+        for peer_id in handoffs {
+            self.close_relay_after_handoff(peer_id, &mut effects);
         }
         effects
     }
@@ -641,6 +731,47 @@ impl ConnectionState {
             .get(&peer_id)
             .map(PeerConnectionRoutes::relayed_connections)
             .unwrap_or_default()
+    }
+
+    fn schedule_relay_handoff(
+        &mut self,
+        peer_id: PeerId,
+        now: Instant,
+        effects: &mut Vec<ConnectionEffect>,
+    ) {
+        if !self.has_direct(peer_id) || !self.has_relayed(peer_id) {
+            self.relay_handoffs.remove(&peer_id);
+            return;
+        }
+
+        let deadline = now + DIRECT_RELAY_HANDOFF_GRACE;
+        if self.relay_handoffs.insert(peer_id, deadline).is_none() {
+            effects.push(ConnectionEffect::Status(format!(
+                "direct connection ready with {peer_id}; keeping relay for {} handoff",
+                format_retry_duration(DIRECT_RELAY_HANDOFF_GRACE)
+            )));
+        }
+    }
+
+    fn close_relay_after_handoff(&mut self, peer_id: PeerId, effects: &mut Vec<ConnectionEffect>) {
+        if !self.has_direct(peer_id) || !self.has_relayed(peer_id) {
+            self.relay_handoffs.remove(&peer_id);
+            return;
+        }
+        if !self.is_chat_subscribed(peer_id) {
+            self.relay_handoffs.remove(&peer_id);
+            return;
+        }
+
+        let relay_connections = self.relay_connections(peer_id);
+        self.relay_handoffs.remove(&peer_id);
+        if !relay_connections.is_empty() {
+            effects.push(ConnectionEffect::CloseRelayConnections {
+                peer_id,
+                connection_ids: relay_connections,
+                reason: RelayCloseReason::HandoffSettled,
+            });
+        }
     }
 }
 
@@ -873,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_subscription_closes_relay_when_direct_route_exists() {
+    fn chat_subscription_schedules_relay_handoff_when_direct_route_exists() {
         let local = peer_id();
         let peer = peer_id();
         let now = Instant::now();
@@ -883,16 +1014,70 @@ mod tests {
         state.connection_established(peer, cid(2), false, false, now + GOSSIP_WARMUP_TIMEOUT);
 
         let effects = state.chat_subscribed(peer, now + GOSSIP_WARMUP_TIMEOUT);
+        assert!(
+            status_text(&effects)
+                .iter()
+                .any(|status| status.contains("keeping relay"))
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ConnectionEffect::CloseRelayConnections { .. }))
+        );
+
+        let effects = state.warmup_tick(now + GOSSIP_WARMUP_TIMEOUT + DIRECT_RELAY_HANDOFF_GRACE);
         assert!(effects.iter().any(|effect| {
             matches!(
                 effect,
                 ConnectionEffect::CloseRelayConnections {
                     peer_id: effect_peer,
                     connection_ids,
-                    reason: RelayCloseReason::ChatReady,
+                    reason: RelayCloseReason::HandoffSettled,
                 } if *effect_peer == peer && connection_ids == &vec![cid(1)]
             )
         }));
+    }
+
+    #[test]
+    fn direct_handoff_keeps_relay_if_direct_drops_before_grace() {
+        let local = peer_id();
+        let peer = peer_id();
+        let now = Instant::now();
+        let mut state = ConnectionState::new(local);
+
+        state.connection_established(peer, cid(1), true, false, now);
+        state.chat_subscribed(peer, now);
+        state.connection_established(peer, cid(2), false, false, now + Duration::from_secs(1));
+        state.connection_closed(peer, cid(2), false, 1);
+
+        let effects = state.warmup_tick(now + DIRECT_RELAY_HANDOFF_GRACE + Duration::from_secs(1));
+        assert!(state.has_relayed(peer));
+        assert!(!state.has_direct(peer));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ConnectionEffect::CloseRelayConnections { .. }))
+        );
+    }
+
+    #[test]
+    fn unsubscribe_while_connected_does_not_clear_chat_readiness() {
+        let local = peer_id();
+        let peer = peer_id();
+        let now = Instant::now();
+        let mut state = ConnectionState::new(local);
+
+        state.connection_established(peer, cid(1), true, false, now);
+        state.chat_subscribed(peer, now);
+
+        let effects = state.chat_unsubscribed(peer);
+
+        assert!(state.is_chat_subscribed(peer));
+        assert!(
+            status_text(&effects)
+                .iter()
+                .any(|status| status.contains("still connected"))
+        );
     }
 
     #[test]
@@ -928,6 +1113,81 @@ mod tests {
 
         assert!(has_dial_for(&first, peer));
         assert!(!has_dial_for(&second, peer));
+    }
+
+    #[test]
+    fn peer_views_report_routes_and_direct_promotion_counters() {
+        let local = peer_id();
+        let relay_peer = peer_id();
+        let direct_peer = peer_id();
+        let rendezvous = peer_id();
+        let now = Instant::now();
+        let mut state = ConnectionState::new(local);
+
+        state.connection_established(relay_peer, cid(1), true, false, now);
+        state.chat_subscribed(relay_peer, now);
+        assert!(has_dial_for(
+            &state.learn_direct_addresses(relay_peer, [addr(relay_peer, 4001)], now),
+            relay_peer
+        ));
+        state.outgoing_connection_error(
+            relay_peer,
+            "outgoing direct dial failed".to_string(),
+            now + Duration::from_secs(1),
+        );
+        state.connection_established(direct_peer, cid(2), false, false, now);
+        state.connection_established(rendezvous, cid(3), true, true, now);
+
+        let views = state.peer_views(&HashSet::from([rendezvous]));
+        let relay_view = views
+            .iter()
+            .find(|view| view.peer_id == relay_peer.to_string())
+            .unwrap();
+        assert_eq!(relay_view.kind, "room");
+        assert_eq!(relay_view.route, "relay");
+        assert_eq!(relay_view.relayed_connections, 1);
+        assert_eq!(relay_view.direct_address_count, 1);
+        assert!(relay_view.chat_subscribed);
+        assert_eq!(relay_view.direct_promotion_attempts, 1);
+        assert_eq!(relay_view.direct_promotion_failures, 1);
+
+        let direct_view = views
+            .iter()
+            .find(|view| view.peer_id == direct_peer.to_string())
+            .unwrap();
+        assert_eq!(direct_view.route, "direct");
+        assert_eq!(direct_view.direct_connections, 1);
+
+        let rendezvous_view = views
+            .iter()
+            .find(|view| view.peer_id == rendezvous.to_string())
+            .unwrap();
+        assert_eq!(rendezvous_view.kind, "rendezvous");
+        assert_eq!(rendezvous_view.route, "relay");
+    }
+
+    #[test]
+    fn direct_promotion_failure_keeps_relay_route_available() {
+        let local = peer_id();
+        let peer = peer_id();
+        let now = Instant::now();
+        let mut state = ConnectionState::new(local);
+
+        state.connection_established(peer, cid(1), true, false, now);
+        state.chat_subscribed(peer, now);
+        assert!(has_dial_for(
+            &state.learn_direct_addresses(peer, [addr(peer, 4001)], now),
+            peer
+        ));
+
+        state.outgoing_connection_error(
+            peer,
+            "outgoing direct dial failed".to_string(),
+            now + Duration::from_secs(1),
+        );
+
+        assert!(state.has_relayed(peer));
+        assert!(state.is_relay_only(peer));
     }
 
     #[test]

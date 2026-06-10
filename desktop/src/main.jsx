@@ -1,7 +1,9 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  ArrowDown,
   ArrowLeft,
+  ArrowUp,
   ChevronDown,
   Check,
   GripVertical,
@@ -9,12 +11,14 @@ import {
   Pause,
   Play,
   Radio,
+  Search,
   Send,
   Shuffle,
   Signal,
   SkipForward,
   Trash2,
   Vote,
+  Volume2,
   X,
 } from "lucide-react";
 import "./styles.css";
@@ -36,6 +40,7 @@ const initialConfig = {
 const initialRoom = {
   messages: [],
   statuses: [],
+  logs: [],
   playback: null,
   peerCount: 0,
   localPeerId: "",
@@ -43,6 +48,7 @@ const initialRoom = {
   backendStarting: false,
   queue: null,
   vote: null,
+  peers: [],
 };
 
 function App() {
@@ -160,6 +166,7 @@ function App() {
       {logOpen && (
         <StatusLogModal
           statuses={room.statuses}
+          logs={room.logs}
           onClose={() => setLogOpen(false)}
         />
       )}
@@ -265,9 +272,12 @@ function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
 
 function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
   const [chatText, setChatText] = useState("");
+  const [chatComposing, setChatComposing] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
+  const [peerOverviewOpen, setPeerOverviewOpen] = useState(false);
   const [pendingMove, setPendingMove] = useState(null);
   const [pendingSeek, setPendingSeek] = useState(null);
+  const [volume, setVolume] = useState(100);
 
   const playback = room.playback;
   const queueCount = room.queue?.items?.length ?? 0;
@@ -282,6 +292,7 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
 
   async function sendChat(event) {
     event.preventDefault();
+    if (chatComposing || event.nativeEvent?.isComposing) return;
     const text = chatText.trim();
     if (!text) return;
     if (await callCommand("send_chat", { text })) {
@@ -320,6 +331,12 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
     }
   }
 
+  async function changeVolume(nextVolume) {
+    const percent = Math.min(100, Math.max(0, Number(nextVolume) || 0));
+    setVolume(percent);
+    await callCommand("set_volume", { percent });
+  }
+
   return (
     <main className="console-page" data-backend="running">
       <RoomNavBar
@@ -328,6 +345,7 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
         queueCount={queueCount}
         onBack={previewBackToSetup}
         onQueue={openQueue}
+        onOpenPeers={() => setPeerOverviewOpen(true)}
         onOpenLog={onOpenLog}
         displayName={displayName}
       />
@@ -350,6 +368,13 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
               autoComplete="off"
               placeholder="Message the room"
               onChange={(event) => setChatText(event.target.value)}
+              onCompositionStart={() => setChatComposing(true)}
+              onCompositionEnd={() => setChatComposing(false)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (chatComposing || event.nativeEvent?.isComposing)) {
+                  event.preventDefault();
+                }
+              }}
             />
             <button className="btn primary" type="submit">
               <Send size={17} aria-hidden="true" />
@@ -362,8 +387,10 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
       <PlayerDock
         playback={playback}
         progress={progress}
+        volume={volume}
         onCommand={callCommand}
         onSeekRequest={setPendingSeek}
+        onVolumeChange={changeVolume}
         displayName={displayName}
       />
 
@@ -392,6 +419,15 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
         />
       )}
 
+      {peerOverviewOpen && (
+        <PeerOverviewModal
+          peers={room.peers}
+          peerCount={room.peerCount}
+          displayName={displayName}
+          onClose={() => setPeerOverviewOpen(false)}
+        />
+      )}
+
       {room.vote && (
         <VoteModal
           vote={room.vote}
@@ -403,7 +439,16 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
   );
 }
 
-function RoomNavBar({ config, room, queueCount, onBack, onQueue, onOpenLog, displayName }) {
+function RoomNavBar({
+  config,
+  room,
+  queueCount,
+  onBack,
+  onQueue,
+  onOpenPeers,
+  onOpenLog,
+  displayName,
+}) {
   const latestStatus = room.statuses.at(-1) ?? "quiet";
   const localName = displayName(room.localPeerId);
 
@@ -425,10 +470,15 @@ function RoomNavBar({ config, room, queueCount, onBack, onQueue, onOpenLog, disp
           <Radio size={14} aria-hidden="true" />
           {localName}
         </span>
-        <span className="nav-chip">
+        <button
+          className="nav-chip peer-nav-button"
+          type="button"
+          onClick={onOpenPeers}
+          aria-label={`Open peer overview: ${room.peerCount} peers`}
+        >
           <Signal size={14} aria-hidden="true" />
           {room.peerCount} peers
-        </span>
+        </button>
         <span className="nav-chip topic-chip" title={config.topic}>{config.topic}</span>
       </div>
 
@@ -452,8 +502,18 @@ function RoomNavBar({ config, room, queueCount, onBack, onQueue, onOpenLog, disp
   );
 }
 
-function PlayerDock({ playback, progress, onCommand, onSeekRequest, displayName }) {
+function PlayerDock({
+  playback,
+  progress,
+  volume,
+  onCommand,
+  onSeekRequest,
+  onVolumeChange,
+  displayName,
+}) {
   const leaderName = playback ? displayName(playback.leader_peer_id, playback.leader_name) : "";
+  const playPauseCommand = playback?.playing ? "pause" : "resume";
+  const playPauseLabel = playback ? (playback.playing ? "Pause" : "Resume") : "Play/Pause";
 
   return (
     <section className="player-dock" aria-label="Playback controls">
@@ -477,15 +537,33 @@ function PlayerDock({ playback, progress, onCommand, onSeekRequest, displayName 
       </div>
 
       <div className="transport-buttons">
-        <IconButton label="Pause" onClick={() => onCommand("pause")}>
-          <Pause size={20} aria-hidden="true" />
+        <IconButton
+          label={playPauseLabel}
+          disabled={!playback}
+          onClick={() => onCommand(playPauseCommand)}
+        >
+          {playback?.playing ? (
+            <Pause size={20} aria-hidden="true" />
+          ) : (
+            <Play size={20} aria-hidden="true" />
+          )}
         </IconButton>
-        <IconButton label="Resume" onClick={() => onCommand("resume")}>
-          <Play size={20} aria-hidden="true" />
-        </IconButton>
-        <IconButton label="Skip" danger onClick={() => onCommand("skip")}>
+        <IconButton label="Skip" danger disabled={!playback} onClick={() => onCommand("skip")}>
           <SkipForward size={20} aria-hidden="true" />
         </IconButton>
+        <label className="volume-control" title="Local volume">
+          <Volume2 size={17} aria-hidden="true" />
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value={volume}
+            aria-label="Local volume"
+            onChange={(event) => onVolumeChange(event.target.value)}
+          />
+          <span>{volume}%</span>
+        </label>
       </div>
     </section>
   );
@@ -573,7 +651,7 @@ function SeekBar({ playback, progress, onSeekRequest }) {
 }
 
 function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, displayName }) {
-  const [queueForm, setQueueForm] = useState({ bvid: "", part: "", position: "" });
+  const [queueForm, setQueueForm] = useState({ bvid: "", part: "" });
   const items = queue?.items ?? [];
 
   async function enqueue(event) {
@@ -583,10 +661,9 @@ function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, display
     const queued = await callCommand("enqueue_bilibili", {
       bvid,
       part: numberOrNull(queueForm.part),
-      position: numberOrNull(queueForm.position),
     });
     if (queued) {
-      setQueueForm({ bvid: "", part: "", position: "" });
+      setQueueForm({ bvid: "", part: "" });
     }
   }
 
@@ -605,7 +682,7 @@ function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, display
         </div>
 
         <form className="stack queue-add-form" onSubmit={enqueue}>
-          <div className="field-row">
+          <div className="field-row queue-add-row">
             <input
               value={queueForm.bvid}
               autoComplete="off"
@@ -620,16 +697,6 @@ function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, display
               placeholder="part"
               aria-label="Part"
               onChange={(event) => setQueueValue(setQueueForm, "part", event.target.value)}
-            />
-          </div>
-          <div className="field-row">
-            <input
-              value={queueForm.position}
-              type="number"
-              min="1"
-              placeholder="insert position"
-              aria-label="Insert position"
-              onChange={(event) => setQueueValue(setQueueForm, "position", event.target.value)}
             />
             <button className="btn primary" type="submit">
               <ListMusic size={17} aria-hidden="true" />
@@ -662,14 +729,25 @@ function QueueList({ items, onRemove, onRequestMove, displayName }) {
     setOverIndex(null);
   }
 
+  function indexFromPointer(event) {
+    const element = document.elementFromPoint(event.clientX, event.clientY);
+    const card = element?.closest?.("[data-queue-index]");
+    const index = Number(card?.dataset.queueIndex);
+    return Number.isInteger(index) ? index : null;
+  }
+
   function requestMove(fromIndex, toIndex) {
-    if (fromIndex === null || toIndex === null || fromIndex === toIndex) {
-      clearDrag();
+    if (
+      fromIndex === null
+      || toIndex === null
+      || fromIndex === toIndex
+      || toIndex < 0
+      || toIndex >= items.length
+    ) {
       return;
     }
     const item = items[fromIndex];
     if (!item) {
-      clearDrag();
       return;
     }
     onRequestMove({
@@ -678,7 +756,6 @@ function QueueList({ items, onRemove, onRequestMove, displayName }) {
       title: item.track.title,
       meta: `${item.track.bvid} P${item.track.part || 1}`,
     });
-    clearDrag();
   }
 
   return (
@@ -687,28 +764,42 @@ function QueueList({ items, onRemove, onRequestMove, displayName }) {
         <article
           className={`queue-card${dragIndex === index ? " dragging" : ""}${overIndex === index && dragIndex !== index ? " drag-over" : ""}`}
           key={item.item_id}
-          draggable
-          onDragStart={(event) => {
-            event.dataTransfer.effectAllowed = "move";
-            event.dataTransfer.setData("text/plain", String(index));
-            setDragIndex(index);
-          }}
-          onDragEnter={() => setOverIndex(index)}
-          onDragOver={(event) => {
-            event.preventDefault();
-            event.dataTransfer.dropEffect = "move";
-            setOverIndex(index);
-          }}
-          onDrop={(event) => {
-            event.preventDefault();
-            const from = Number(event.dataTransfer.getData("text/plain"));
-            requestMove(Number.isFinite(from) ? from : dragIndex, index);
-          }}
-          onDragEnd={clearDrag}
+          data-queue-index={index}
         >
-          <span className="drag-handle" title="Drag to move" aria-hidden="true">
-            <GripVertical size={17} />
-          </span>
+          <button
+            className="queue-drag-handle"
+            type="button"
+            title={`Drag ${item.track.title}`}
+            aria-label={`Move ${item.track.title}`}
+            onPointerDown={(event) => {
+              event.preventDefault();
+              event.currentTarget.setPointerCapture(event.pointerId);
+              setDragIndex(index);
+              setOverIndex(index);
+            }}
+            onPointerMove={(event) => {
+              if (dragIndex === null) return;
+              const nextIndex = indexFromPointer(event);
+              if (nextIndex !== null) {
+                setOverIndex(nextIndex);
+              }
+            }}
+            onPointerUp={(event) => {
+              if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                event.currentTarget.releasePointerCapture(event.pointerId);
+              }
+              requestMove(dragIndex ?? index, overIndex ?? index);
+              clearDrag();
+            }}
+            onPointerCancel={clearDrag}
+            onKeyDown={(event) => {
+              if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+              event.preventDefault();
+              requestMove(index, index + (event.key === "ArrowDown" ? 1 : -1));
+            }}
+          >
+            <GripVertical size={17} aria-hidden="true" />
+          </button>
           <div className="queue-index">{index + 1}</div>
           <div className="queue-track">
             <strong>{item.track.title}</strong>
@@ -716,6 +807,22 @@ function QueueList({ items, onRemove, onRequestMove, displayName }) {
               {item.track.bvid} P{item.track.part || 1} - {formatMs(item.track.duration_ms)}
             </span>
             <small>by {displayName(item.requested_by, item.requested_by_name)}</small>
+          </div>
+          <div className="queue-move-actions">
+            <IconButton
+              label={`Move ${item.track.title} up`}
+              disabled={index === 0}
+              onClick={() => requestMove(index, index - 1)}
+            >
+              <ArrowUp size={16} aria-hidden="true" />
+            </IconButton>
+            <IconButton
+              label={`Move ${item.track.title} down`}
+              disabled={index === items.length - 1}
+              onClick={() => requestMove(index, index + 1)}
+            >
+              <ArrowDown size={16} aria-hidden="true" />
+            </IconButton>
           </div>
           <IconButton label={`Remove ${item.track.title}`} danger onClick={() => onRemove(index + 1)}>
             <Trash2 size={17} aria-hidden="true" />
@@ -832,7 +939,24 @@ function VoteModal({ vote, onVote, displayName }) {
   );
 }
 
-function StatusLogModal({ statuses, onClose }) {
+function StatusLogModal({ statuses, logs, onClose }) {
+  const listRef = useRef(null);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("all");
+  const entries = logs?.length ? logs : statuses.map((line, index) => createLogEntry(line, index));
+  const summary = summarizeLogs(entries);
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleEntries = entries.filter((entry) => {
+    const matchesQuery =
+      !normalizedQuery ||
+      entry.text.toLowerCase().includes(normalizedQuery) ||
+      entry.category.toLowerCase().includes(normalizedQuery) ||
+      entry.level.toLowerCase().includes(normalizedQuery);
+    const matchesFilter =
+      filter === "all" || entry.level === filter || entry.category === filter;
+    return matchesQuery && matchesFilter;
+  });
+
   useEffect(() => {
     function closeOnEscape(event) {
       if (event.key === "Escape") {
@@ -843,6 +967,13 @@ function StatusLogModal({ statuses, onClose }) {
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [onClose]);
+
+  useEffect(() => {
+    const list = listRef.current;
+    if (list) {
+      list.scrollTop = list.scrollHeight;
+    }
+  }, [visibleEntries.length]);
 
   return (
     <div
@@ -867,14 +998,55 @@ function StatusLogModal({ statuses, onClose }) {
           </IconButton>
         </div>
 
-        <div className="log-list" role="log" aria-live="polite">
-          {statuses.length === 0 ? (
+        <div className="log-toolbar">
+          <label className="log-search">
+            <Search size={15} aria-hidden="true" />
+            <input
+              value={query}
+              type="search"
+              placeholder="Search log"
+              aria-label="Search status log"
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+          <select
+            value={filter}
+            aria-label="Filter status log"
+            onChange={(event) => setFilter(event.target.value)}
+          >
+            <option value="all">All</option>
+            <option value="error">Errors</option>
+            <option value="warn">Warnings</option>
+            <option value="success">Success</option>
+            <option value="info">Info</option>
+            <option value="network">Network</option>
+            <option value="sync">Sync</option>
+            <option value="playback">Playback</option>
+            <option value="queue">Queue</option>
+            <option value="vote">Vote</option>
+            <option value="system">System</option>
+          </select>
+        </div>
+
+        <div className="log-summary" aria-label="Log summary">
+          <span className="log-chip error">{summary.error}</span>
+          <span className="log-chip warn">{summary.warn}</span>
+          <span className="log-chip success">{summary.success}</span>
+          <span className="log-chip info">{summary.info}</span>
+        </div>
+
+        <div className="log-list" role="log" aria-live="polite" ref={listRef}>
+          {visibleEntries.length === 0 ? (
             <div className="empty-state">quiet</div>
           ) : (
-            statuses.map((line, index) => (
-              <article className="log-entry" key={`${line}-${index}`}>
-                <span>{String(index + 1).padStart(2, "0")}</span>
-                <p>{line}</p>
+            visibleEntries.map((entry) => (
+              <article className={`log-entry log-${entry.level}`} key={entry.id}>
+                <div className="log-entry-meta">
+                  <span>{formatLogTime(entry.at)}</span>
+                  <strong>{entry.level}</strong>
+                  <span>{entry.category}</span>
+                </div>
+                <p>{entry.text}</p>
               </article>
             ))
           )}
@@ -882,6 +1054,116 @@ function StatusLogModal({ statuses, onClose }) {
       </section>
     </div>
   );
+}
+
+function PeerOverviewModal({ peers, peerCount, displayName, onClose }) {
+  useEffect(() => {
+    function closeOnEscape(event) {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    }
+
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  const roomPeers = peers.filter((peer) => peer.kind !== "rendezvous");
+  const infraPeers = peers.filter((peer) => peer.kind === "rendezvous");
+
+  return (
+    <div
+      className="modal-scrim peer-scrim"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Peer overview"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <section className="modal-card peer-modal">
+        <div className="panel-head split">
+          <div>
+            <p className="overline">Network</p>
+            <h2>{peerCount} peers</h2>
+          </div>
+          <IconButton label="Close peer overview" onClick={onClose}>
+            <X size={18} aria-hidden="true" />
+          </IconButton>
+        </div>
+
+        <PeerGroup
+          title="Room"
+          peers={roomPeers}
+          empty="no connected room peers"
+          displayName={displayName}
+        />
+        {infraPeers.length > 0 && (
+          <PeerGroup
+            title="Infrastructure"
+            peers={infraPeers}
+            empty=""
+            displayName={displayName}
+          />
+        )}
+      </section>
+    </div>
+  );
+}
+
+function PeerGroup({ title, peers, empty, displayName }) {
+  return (
+    <section className="peer-group">
+      <div className="peer-group-head">
+        <h3>{title}</h3>
+        <span>{peers.length}</span>
+      </div>
+
+      {peers.length === 0 ? (
+        <div className="empty-state">{empty}</div>
+      ) : (
+        <div className="peer-list">
+          {peers.map((peer) => (
+            <article className="peer-row" key={peer.peer_id}>
+              <div className="peer-row-main">
+                <strong title={peer.peer_id}>{displayName(peer.peer_id)}</strong>
+                <span>{shortPeer(peer.peer_id)}</span>
+              </div>
+              <span className={`route-pill route-${routeClass(peer.route)}`}>{peer.route}</span>
+              <dl className="peer-stats">
+                <div>
+                  <dt>links</dt>
+                  <dd>{peer.direct_connections}d / {peer.relayed_connections}r</dd>
+                </div>
+                <div>
+                  <dt>addr</dt>
+                  <dd>{peer.direct_address_count}</dd>
+                </div>
+                <div>
+                  <dt>chat</dt>
+                  <dd>{peer.chat_subscribed ? "ready" : "wait"}</dd>
+                </div>
+                <div>
+                  <dt>direct</dt>
+                  <dd>
+                    {peer.direct_promotion_attempts}/{peer.direct_promotion_failures}
+                    {peer.direct_promotion_in_flight ? " now" : ""}
+                    {peer.direct_promotion_suspended ? " hold" : ""}
+                  </dd>
+                </div>
+              </dl>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function routeClass(route) {
+  return String(route || "known").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
 }
 
 function Brand({ localPeerId }) {
@@ -906,15 +1188,25 @@ function Field({ label, children }) {
   );
 }
 
-function IconButton({ label, danger = false, children, onClick }) {
+function IconButton({ label, danger = false, disabled = false, children, onClick }) {
   return (
-    <button className={`icon-button${danger ? " danger" : ""}`} type="button" title={label} aria-label={label} onClick={onClick}>
+    <button
+      className={`icon-button${danger ? " danger" : ""}`}
+      type="button"
+      title={label}
+      aria-label={label}
+      onClick={onClick}
+      disabled={disabled}
+    >
       {children}
     </button>
   );
 }
 
 function MessageList({ messages }) {
+  const viewportRef = useRef(null);
+  const stickToBottomRef = useRef(true);
+  const [showJump, setShowJump] = useState(false);
   const rendered = useMemo(() => messages.map((record) => ({
     ...record,
     time: new Date(normalizeMicros(record.sent_at) / 1000).toLocaleTimeString([], {
@@ -923,21 +1215,55 @@ function MessageList({ messages }) {
     }),
   })), [messages]);
 
-  if (rendered.length === 0) {
-    return <div className="empty-state">no messages</div>;
+  function scrollToLatest() {
+    const node = viewportRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+    stickToBottomRef.current = true;
+    setShowJump(false);
   }
 
+  function updateScrollIntent() {
+    const node = viewportRef.current;
+    if (!node) return;
+    const distanceToBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+    const nearBottom = distanceToBottom < 36;
+    stickToBottomRef.current = nearBottom;
+    setShowJump(!nearBottom && rendered.length > 0);
+  }
+
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    const frame = requestAnimationFrame(scrollToLatest);
+    return () => cancelAnimationFrame(frame);
+  }, [rendered.length]);
+
   return (
-    <div className="messages">
-      {rendered.map((record) => (
-        <article className="message" key={record.id}>
-          <header>
-            <strong>{record.author}</strong>
-            <time>{record.time}</time>
-          </header>
-          <p>{record.text}</p>
-        </article>
-      ))}
+    <div
+      className={`messages${rendered.length === 0 ? " messages-empty" : ""}`}
+      ref={viewportRef}
+      onScroll={updateScrollIntent}
+    >
+      <div className="messages-stack">
+        {rendered.length === 0 ? (
+          <div className="empty-state">no messages</div>
+        ) : (
+          rendered.map((record) => (
+            <article className="message" key={record.id}>
+              <header>
+                <strong>{record.author}</strong>
+                <time>{record.time}</time>
+              </header>
+              <p>{record.text}</p>
+            </article>
+          ))
+        )}
+      </div>
+      {showJump && (
+        <button className="scroll-latest" type="button" onClick={scrollToLatest}>
+          Latest
+        </button>
+      )}
     </div>
   );
 }
@@ -1001,15 +1327,22 @@ function applyBackendEvent(current, event) {
       return { ...current, queue: event.payload };
     case "vote":
       return { ...current, vote: event.payload };
+    case "peers":
+      return { ...current, peers: event.payload ?? [] };
     default:
       return current;
   }
 }
 
 function appendStatus(room, status) {
+  const text = String(status ?? "");
+  const previousLogs = room.logs ?? room.statuses.map((line, index) => createLogEntry(line, index));
+  const entry = createLogEntry(text, previousLogs.length);
+
   return {
     ...room,
-    statuses: room.statuses.concat(status).slice(-80),
+    statuses: room.statuses.concat(text).slice(-80),
+    logs: previousLogs.concat(entry).slice(-300),
   };
 }
 
@@ -1043,6 +1376,63 @@ function normalizeMicros(value) {
   if (abs < 10_000_000_000) return value * 1_000_000;
   if (abs < 10_000_000_000_000) return value * 1_000;
   return value;
+}
+
+function createLogEntry(status, index) {
+  const text = String(status ?? "");
+  const { level, category } = classifyLogLine(text);
+  return {
+    id: `${Date.now()}-${index}-${text.slice(0, 24)}`,
+    at: Date.now(),
+    text,
+    level,
+    category,
+  };
+}
+
+function classifyLogLine(text) {
+  const line = text.toLowerCase();
+  const level = (() => {
+    if (/\b(failed|failure|error|unavailable|invalid|rejected)\b/.test(line)) return "error";
+    if (/\b(timeout|timed out|retry|suspended|ignored|no active|no peers|waiting|slow)\b/.test(line)) {
+      return "warn";
+    }
+    if (/\b(ready|connected|queued|removed|moved|accepted|succeeded|published|joined)\b/.test(line)) {
+      return "success";
+    }
+    return "info";
+  })();
+
+  const category = (() => {
+    if (/\b(vote|ballot)\b/.test(line)) return "vote";
+    if (/\b(queue|queued|enqueue|item)\b/.test(line)) return "queue";
+    if (/\b(playback|audio|seek|volume|bilibili|now:|preparing|downloading)\b/.test(line)) return "playback";
+    if (/\b(history|sync|snapshot|summary)\b/.test(line)) return "sync";
+    if (/\b(direct|relay|rendezvous|gossip|gossipsub|mdns|identify|peer|dial|connection|listen)\b/.test(line)) {
+      return "network";
+    }
+    return "system";
+  })();
+
+  return { level, category };
+}
+
+function summarizeLogs(entries) {
+  return entries.reduce(
+    (counts, entry) => ({
+      ...counts,
+      [entry.level]: (counts[entry.level] ?? 0) + 1,
+    }),
+    { error: 0, warn: 0, success: 0, info: 0 },
+  );
+}
+
+function formatLogTime(value) {
+  return new Date(value).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 function buildPeerNames(messages, localPeerId, localName) {
@@ -1097,6 +1487,7 @@ async function previewInvoke(command, args = {}) {
       emitPreview("backend-event", { type: "history", payload: previewMessages() });
       emitPreview("backend-event", { type: "playback", payload: previewPlayback() });
       emitPreview("backend-event", { type: "queue", payload: previewQueue() });
+      emitPreview("backend-event", { type: "peers", payload: previewPeers() });
       return;
     case "send_chat":
       emitPreview("backend-event", {
@@ -1146,10 +1537,31 @@ async function previewInvoke(command, args = {}) {
       emitPreview("backend-event", { type: "status", payload: `seek accepted ${args.seconds || 0}s` });
       return;
     case "pause":
+      emitPreview("backend-event", {
+        type: "playback",
+        payload: {
+          ...previewPlayback(),
+          playing: false,
+        },
+      });
+      emitPreview("backend-event", { type: "status", payload: "pause accepted" });
+      return;
     case "resume":
+      emitPreview("backend-event", {
+        type: "playback",
+        payload: {
+          ...previewPlayback(),
+          playing: true,
+        },
+      });
+      emitPreview("backend-event", { type: "status", payload: "resume accepted" });
+      return;
     case "skip":
     case "remove_queue_item":
       emitPreview("backend-event", { type: "status", payload: `${command} accepted` });
+      return;
+    case "set_volume":
+      emitPreview("backend-event", { type: "status", payload: `local volume set to ${args.percent}%` });
       return;
     default:
       return;
@@ -1191,6 +1603,50 @@ function previewPlayback() {
     leader_peer_id: "12D3KooW-leader-preview",
     leader_name: "alice",
   };
+}
+
+function previewPeers() {
+  return [
+    {
+      peer_id: "12D3KooW-alice",
+      kind: "room",
+      route: "direct",
+      direct_connections: 1,
+      relayed_connections: 0,
+      direct_address_count: 2,
+      chat_subscribed: true,
+      direct_promotion_attempts: 1,
+      direct_promotion_failures: 0,
+      direct_promotion_in_flight: false,
+      direct_promotion_suspended: false,
+    },
+    {
+      peer_id: "12D3KooW-bob",
+      kind: "room",
+      route: "relay",
+      direct_connections: 0,
+      relayed_connections: 1,
+      direct_address_count: 1,
+      chat_subscribed: true,
+      direct_promotion_attempts: 4,
+      direct_promotion_failures: 3,
+      direct_promotion_in_flight: false,
+      direct_promotion_suspended: false,
+    },
+    {
+      peer_id: "12D3KooW-rendezvous",
+      kind: "rendezvous",
+      route: "relay",
+      direct_connections: 0,
+      relayed_connections: 1,
+      direct_address_count: 0,
+      chat_subscribed: false,
+      direct_promotion_attempts: 0,
+      direct_promotion_failures: 0,
+      direct_promotion_in_flight: false,
+      direct_promotion_suspended: false,
+    },
+  ];
 }
 
 function previewQueue(extra = {}) {

@@ -1,6 +1,6 @@
 # link-ear
 
-`link-ear` is a Rust terminal app for peer-to-peer chat. It uses libp2p as the network layer and keeps the application protocol extensible so listening-party features can be added later.
+`link-ear` is a Rust/libp2p peer-to-peer chat and shared listening app. Peers can chat, co-manage a music queue, and keep playback state roughly synchronized through the terminal UI or the Tauri desktop shell.
 
 ## Run
 
@@ -93,7 +93,7 @@ Music commands:
 
 ```text
 /bv <BV_ID> [PART]            Append Bilibili audio to the queue
-/insert <INDEX> <BV_ID> [PART] Insert Bilibili audio before a queue position
+/insert <INDEX> <BV_ID> [PART] Compatibility alias; backend still appends
 /queue or /q                  Show the current track and the next queue items
 /skip                         Skip the current track
 /remove <INDEX>               Remove a queued track
@@ -106,9 +106,11 @@ Music commands:
 
 `PART` is 1-based and defaults to `1`.
 
+The desktop queue form only appends. Reordering is handled by move votes.
+
 ## Names
 
-Clients announce their `peer_id`, display name, and join timestamp to the chat topic. If peers use the same name, the earliest join wins and later peers with that name are blocked from sending. Restart with a different `--name` to join under a unique name.
+Clients announce their `peer_id`, display name, and join timestamp to the chat topic. Display names are only aliases: multiple peers may use the same visible name, and the peer id remains the unique identity. UIs may show a short peer id when a name needs disambiguation.
 
 ## History sync
 
@@ -116,8 +118,19 @@ Clients publish a lightweight history summary when a peer connects, when a peer 
 
 Message timestamps use microsecond precision for ordering. Duplicate history records are expected during sync and are silently ignored.
 
+## Relay fallback
+
+Relay-backed routes are kept during a short direct-connection handoff window. If
+the direct route drops during that window, the relay route stays available for
+chat, sync, playback, and vote messages. Once direct is settled and chat
+subscription is ready, relay links may close for that peer.
+
 ## Music sync
 
 Music sync uses a shared queue and playback state instead of P2P audio streaming. The peer that starts the next queue item resolves the Bilibili BV through the web API, announces a prepare phase, and every expected peer downloads the audio URL locally before playback starts. The leader broadcasts playback state every second; peers seek when local drift is larger than about `700ms`.
 
-Queue insertion is immediate. Moving tracks, removing another peer's queued track, or asking to pause/resume/seek/skip opens a single active vote; a majority of connected peers must approve before the operation executes. Only the peer who added the currently playing track can pause/resume/seek/skip directly.
+Queue enqueue is immediate and always appends. Moving tracks always opens a vote. Removing your own queued item is direct; removing another peer's queued item opens a vote. The current track requester can seek directly, while other seek requests open a vote. Pause, resume, and skip always open a vote. Majority thresholds count real room peers and exclude relay/rendezvous infrastructure peers.
+
+## Manual smoke test
+
+Use `docs/test-report-audit.md` to see how the real-world test report maps to current implementation and automated coverage. Use `docs/manual-smoke-test.md` for repeatable multi-peer testing. The smoke test covers a three-person room with one relay-only peer, one direct-capable peer, and one slower peer, including chat/history sync, queue votes, playback readiness, direct promotion failure, relay fallback, duplicate display names, IME input, peer overview, and status log checks.
