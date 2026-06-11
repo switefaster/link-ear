@@ -24,8 +24,9 @@ connections when direct addresses become usable so relay traffic stays bounded.
 - `ARCHITECTURE.md`: current architecture boundaries, state-machine rules,
   timing assumptions, and change guidance.
 - `.github/workflows/build.yml`: push-triggered matrix CI build for Windows,
-  Linux, and macOS artifacts. It uploads relay binaries and Tauri desktop
-  bundles, but does not build or upload the legacy TUI binary.
+  Linux, and macOS. It runs frontend/Rust checks and builds the relay binary
+  plus Tauri desktop bundle, but does not upload artifacts or build the legacy
+  TUI binary.
 
 ## Useful checks
 
