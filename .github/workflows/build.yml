@@ -9,21 +9,18 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.artifact_os }} artifacts
+    name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
-            artifact_os: windows
-            relay_binary: link-ear-relay.exe
+            platform: Windows
           - os: ubuntu-22.04
-            artifact_os: linux
-            relay_binary: link-ear-relay
+            platform: Linux
           - os: macos-latest
-            artifact_os: macos
-            relay_binary: link-ear-relay
+            platform: macOS
 
     steps:
       - name: Checkout
@@ -77,19 +74,3 @@ jobs:
 
       - name: Build Tauri desktop bundle
         run: npx --yes @tauri-apps/cli@^2 build
-
-      - name: Upload relay binary
-        uses: actions/upload-artifact@v7
-        with:
-          name: link-ear-${{ matrix.artifact_os }}-relay
-          if-no-files-found: error
-          path: target/release/${{ matrix.relay_binary }}
-
-      - name: Upload desktop bundle
-        uses: actions/upload-artifact@v7
-        with:
-          name: link-ear-${{ matrix.artifact_os }}-desktop
-          if-no-files-found: error
-          path: |
-            src-tauri/target/release/link-ear-desktop*
-            src-tauri/target/release/bundle/**
