@@ -700,7 +700,34 @@ function SeekBar({ playback, progress, onSeekRequest }) {
 
 function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, displayName }) {
   const [queueForm, setQueueForm] = useState({ bvid: "", part: "" });
+  const clipboardBvidRef = useRef("");
   const items = queue?.items ?? [];
+
+  useEffect(() => {
+    if (!open) return undefined;
+
+    let cancelled = false;
+    resolveBilibiliBvidFromClipboard().then((bvid) => {
+      if (cancelled || !bvid) return;
+
+      setQueueForm((current) => {
+        const currentBvid = current.bvid.trim();
+        if (currentBvid && currentBvid !== clipboardBvidRef.current) {
+          return current;
+        }
+        if (currentBvid === bvid) {
+          return current;
+        }
+
+        clipboardBvidRef.current = bvid;
+        return { ...current, bvid };
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
 
   async function enqueue(event) {
     event.preventDefault();
@@ -711,6 +738,7 @@ function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, display
       part: numberOrNull(queueForm.part),
     });
     if (queued) {
+      clipboardBvidRef.current = "";
       setQueueForm({ bvid: "", part: "" });
     }
   }
@@ -736,7 +764,10 @@ function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, display
               autoComplete="off"
               placeholder="BV id"
               aria-label="Bilibili BV id"
-              onChange={(event) => setQueueValue(setQueueForm, "bvid", event.target.value)}
+              onChange={(event) => {
+                clipboardBvidRef.current = "";
+                setQueueValue(setQueueForm, "bvid", event.target.value);
+              }}
             />
             <input
               value={queueForm.part}
@@ -1434,6 +1465,36 @@ function setQueueValue(setState, key, value) {
   setState((current) => ({ ...current, [key]: value }));
 }
 
+async function resolveBilibiliBvidFromClipboard() {
+  const text = await readClipboardText();
+  if (!text) return null;
+
+  const localBvid = extractBilibiliBvid(text);
+  if (localBvid) return localBvid;
+
+  try {
+    const resolved = await invoke("extract_bilibili_bvid", { text });
+    return typeof resolved === "string" && resolved ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readClipboardText() {
+  if (!navigator.clipboard?.readText) return "";
+
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    return "";
+  }
+}
+
+function extractBilibiliBvid(text) {
+  const match = String(text || "").match(/\b[Bb][Vv][0-9A-Za-z]{10}\b/);
+  return match ? `BV${match[0].slice(2)}` : null;
+}
+
 function lines(value) {
   return value
     .split(/\r?\n/)
@@ -1590,6 +1651,8 @@ async function previewInvoke(command, args = {}) {
       emitPreview("backend-event", { type: "status", payload: `queued ${args.bvid || "BV1preview"} part ${args.part || 1}` });
       emitPreview("backend-event", { type: "queue", payload: previewQueue(args) });
       return;
+    case "extract_bilibili_bvid":
+      return extractBilibiliBvid(args.text);
     case "show_queue":
       emitPreview("backend-event", { type: "status", payload: "queue: 1 active, 2 waiting" });
       emitPreview("backend-event", { type: "queue", payload: previewQueue() });
