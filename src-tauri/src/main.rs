@@ -9,6 +9,7 @@ use std::{
 use libp2p::Multiaddr;
 use link_ear::{
     backend::{self, BackendConfig},
+    bilibili,
     core::NetworkCommand,
 };
 use serde::Deserialize;
@@ -106,6 +107,14 @@ async fn enqueue_bilibili(
         },
     )
     .await
+}
+
+#[tauri::command]
+async fn extract_bilibili_bvid(text: String) -> Result<Option<String>, String> {
+    let client = bilibili::client().map_err(|err| format!("{err:#}"))?;
+    bilibili::extract_bvid_from_text_or_short_link(&client, &text)
+        .await
+        .map_err(|err| format!("{err:#}"))
 }
 
 #[tauri::command]
@@ -229,6 +238,7 @@ fn main() {
             start_backend,
             send_chat,
             enqueue_bilibili,
+            extract_bilibili_bvid,
             show_queue,
             pause,
             resume,

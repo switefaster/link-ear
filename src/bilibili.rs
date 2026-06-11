@@ -3,9 +3,10 @@ use std::{error::Error, fmt};
 use anyhow::{Context, Result, anyhow, bail};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{
-    Client, StatusCode,
+    Client, StatusCode, Url,
     header::{
-        ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderValue, PRAGMA, REFERER, USER_AGENT,
+        ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderValue, LOCATION, PRAGMA, REFERER,
+        USER_AGENT,
     },
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -23,6 +24,8 @@ const BILIBILI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Apple
 const BILIBILI_ORIGIN: &str = "https://www.bilibili.com";
 const BILIBILI_API_ACCEPT: &str = "application/json, text/plain, */*";
 const BILIBILI_MEDIA_ACCEPT: &str = "*/*";
+const BVID_LEN: usize = 12;
+const BILIBILI_SHORT_LINK_HOSTS: &[&str] = &["b23.tv", "bili2233.cn"];
 
 #[derive(Debug, Deserialize)]
 struct BilibiliResult<T> {
@@ -118,6 +121,72 @@ pub fn client() -> Result<Client> {
         .default_headers(headers)
         .build()
         .context("failed to build bilibili http client")
+}
+
+pub async fn extract_bvid_from_text_or_short_link(
+    client: &Client,
+    text: &str,
+) -> Result<Option<String>> {
+    if let Some(bvid) = extract_bvid(text) {
+        return Ok(Some(bvid));
+    }
+
+    for url in bilibili_short_urls(text).into_iter().take(3) {
+        let response = client
+            .get(url.as_str())
+            .header(ACCEPT, BILIBILI_API_ACCEPT)
+            .header(REFERER, BILIBILI_ORIGIN)
+            .send()
+            .await
+            .with_context(|| format!("failed to resolve bilibili short link {url}"))?;
+
+        if let Some(bvid) = extract_bvid(response.url().as_str()) {
+            return Ok(Some(bvid));
+        }
+
+        if let Some(location) = response.headers().get(LOCATION).and_then(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|location| extract_bvid(location))
+        }) {
+            return Ok(Some(location));
+        }
+    }
+
+    Ok(None)
+}
+
+pub fn extract_bvid(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    if bytes.len() < BVID_LEN {
+        return None;
+    }
+
+    for start in 0..=bytes.len() - BVID_LEN {
+        if !matches!(bytes[start], b'B' | b'b') || !matches!(bytes[start + 1], b'V' | b'v') {
+            continue;
+        }
+
+        let end = start + BVID_LEN;
+        if !bytes[start + 2..end]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+
+        let before_ok = start == 0 || !is_bvid_boundary_byte(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_bvid_boundary_byte(bytes[end]);
+        if !before_ok || !after_ok {
+            continue;
+        }
+
+        let suffix = std::str::from_utf8(&bytes[start + 2..end]).ok()?;
+        return Some(format!("BV{suffix}"));
+    }
+
+    None
 }
 
 pub async fn resolve_track(
@@ -400,6 +469,100 @@ fn video_referer(bvid: &str) -> String {
     format!("https://www.bilibili.com/video/{bvid}/")
 }
 
+fn bilibili_short_urls(text: &str) -> Vec<Url> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(is_url_trim_char);
+            let start = token.find("https://").or_else(|| token.find("http://"))?;
+            let candidate = &token[start..];
+            let end = candidate
+                .char_indices()
+                .find_map(|(index, ch)| is_url_hard_stop_char(ch).then_some(index))
+                .unwrap_or(candidate.len());
+            let candidate = candidate[..end].trim_matches(is_url_trim_char);
+            let url = Url::parse(candidate).ok()?;
+            is_bilibili_short_url(&url).then_some(url)
+        })
+        .collect()
+}
+
+fn is_bilibili_short_url(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    BILIBILI_SHORT_LINK_HOSTS
+        .iter()
+        .any(|candidate| host.eq_ignore_ascii_case(candidate))
+}
+
+fn is_url_trim_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '<' | '>'
+            | '"'
+            | '\''
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | ','
+            | '.'
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | '，'
+            | '。'
+            | '、'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '“'
+            | '”'
+            | '‘'
+            | '’'
+            | '【'
+            | '】'
+    )
+}
+
+fn is_url_hard_stop_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '<' | '>'
+            | '"'
+            | '\''
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | ','
+            | ';'
+            | '!'
+            | '，'
+            | '。'
+            | '、'
+            | '；'
+            | '！'
+            | '？'
+            | '“'
+            | '”'
+            | '‘'
+            | '’'
+            | '【'
+            | '】'
+    )
+}
+
+fn is_bvid_boundary_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
 fn is_http_precondition_failed(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -471,6 +634,34 @@ fn signed_query<const N: usize>(params: [(&str, String); N], mixin_key: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_bvid_finds_video_ids_in_links_and_share_text() {
+        assert_eq!(
+            extract_bvid("https://www.bilibili.com/video/BV196Ex61ES1/?share_source=copy_link")
+                .as_deref(),
+            Some("BV196Ex61ES1")
+        );
+        assert_eq!(
+            extract_bvid("复制这条消息 bv196Ex61ES1 打开哔哩哔哩").as_deref(),
+            Some("BV196Ex61ES1")
+        );
+        assert_eq!(extract_bvid("prefixBV196Ex61ES1").as_deref(), None);
+        assert_eq!(extract_bvid("BV196Ex61ES10").as_deref(), None);
+    }
+
+    #[test]
+    fn bilibili_short_urls_extracts_known_short_link_hosts() {
+        let urls = bilibili_short_urls(
+            "复制链接 https://b23.tv/abc123，更多文本 https://example.test/BV196Ex61ES1",
+        );
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].as_str(), "https://b23.tv/abc123");
+
+        let urls = bilibili_short_urls("【https://bili2233.cn/xyz987】");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].host_str(), Some("bili2233.cn"));
+    }
 
     #[test]
     fn url_stem_extracts_last_path_stem() {
