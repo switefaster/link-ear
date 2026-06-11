@@ -104,14 +104,16 @@ The relay address is also treated as a rendezvous node. Clients register under t
 Important current timings:
 
 - Swarm idle connection timeout: 1 hour on clients and relay server.
-- Rendezvous registration TTL: 180 seconds.
-- Rendezvous refresh interval: 60 seconds.
+- Rendezvous registration TTL: 2 hours.
+- Rendezvous refresh interval: 1 hour.
 - Rendezvous discovery interval: 30 seconds.
 - Gossipsub warmup before direct promotion timeout: 5 seconds.
 - Direct promotion retry tiers: 30 seconds, then 2 minutes, then 10 minutes, then suspended after the configured max failures.
 - Relay handoff grace after direct connection readiness: 10 seconds.
 
 Rendezvous discovery results for currently disconnected peers are used for the immediate disconnected dial only. They are not cached into the local peer overview. Successful connections and identify events repopulate local connection state. When the last connection to a peer closes, cached direct addresses and backoff state are cleared so the peer overview does not fill with stale `known` peers.
+
+On graceful shutdown, clients attempt to unregister from connected rendezvous nodes before the backend exits. Crashed clients may still remain visible until the rendezvous TTL expires.
 
 ## Direct Promotion Policy
 

@@ -96,6 +96,10 @@ guardrail:
   and much longer than libp2p's 10s default. Relay-only room peers may be idle
   while gossipsub is warming up or direct promotion is failing; the default idle
   timeout can otherwise close the relay route without any local handoff effect.
+- The relay server should keep relay circuit limits suitable for long-lived
+  chat/playback sessions. In libp2p-relay 0.21, `max_circuit_bytes = 0`
+  disables the byte cap, but `max_circuit_duration = 0` would time out
+  immediately; use a long positive duration instead.
 - The peer overview UI is a diagnostic snapshot of local connection state. Keep
   it UI-facing only: route type, direct/relay link counts, known direct address
   count, chat subscription readiness, and direct promotion counters must not be
@@ -103,11 +107,12 @@ guardrail:
 - Direct fallback for targeted history/queue sync requests should send only to
   the target peer. Track request-response failures for those fallback requests
   and clear the matching request cooldown so slow peers can retry sync.
-- Rendezvous registration TTL should stay short and be refreshed periodically,
-  because clients often exit without unregistering. Do not cache rendezvous
-  direct addresses for peers that are not currently connected; use those
-  addresses for the immediate disconnected dial only, and let successful
-  connections/identify repopulate local peer state.
+- Rendezvous registration TTL should follow the libp2p default floor of about
+  two hours to avoid noisy refresh traffic. Clients should unregister from
+  rendezvous on graceful shutdown; crashed clients may remain discoverable until
+  TTL expiry. Do not cache rendezvous direct addresses for peers that are not
+  currently connected; use those addresses for the immediate disconnected dial
+  only, and let successful connections/identify repopulate local peer state.
 - When connected room peers drop to zero after previously being connected,
   enter zero-peer recovery: keep relay/rendezvous infrastructure connected,
   periodically run full rendezvous discovery without the previous cookie, and
