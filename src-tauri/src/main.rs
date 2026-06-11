@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::thread;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::Duration,
+};
 
 use libp2p::Multiaddr;
 use link_ear::{
@@ -8,12 +12,13 @@ use link_ear::{
     core::NetworkCommand,
 };
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::{Mutex, mpsc};
 
 #[derive(Default)]
 struct BackendState {
     commands: Mutex<Option<mpsc::Sender<NetworkCommand>>>,
+    closing: AtomicBool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +157,12 @@ async fn vote(state: State<'_, BackendState>, approve: bool) -> Result<(), Strin
     send_command(&state, NetworkCommand::Vote(approve)).await
 }
 
+#[tauri::command]
+async fn shutdown_backend(state: State<'_, BackendState>) -> Result<(), String> {
+    shutdown_backend_state(state.inner()).await;
+    Ok(())
+}
+
 async fn send_command(
     state: &State<'_, BackendState>,
     command: NetworkCommand,
@@ -164,6 +175,13 @@ async fn send_command(
         .send(command)
         .await
         .map_err(|_| "backend command channel is closed".to_string())
+}
+
+async fn shutdown_backend_state(state: &BackendState) {
+    let mut commands = state.commands.lock().await;
+    if let Some(sender) = commands.take() {
+        let _ = sender.send(NetworkCommand::Shutdown).await;
+    }
 }
 
 fn parse_multiaddrs(values: Vec<String>) -> Result<Vec<Multiaddr>, String> {
@@ -184,6 +202,29 @@ fn parse_multiaddrs(values: Vec<String>) -> Result<Vec<Multiaddr>, String> {
 fn main() {
     tauri::Builder::default()
         .manage(BackendState::default())
+        .on_window_event(|window, event| {
+            if !matches!(event, WindowEvent::CloseRequested { .. }) {
+                return;
+            }
+
+            let WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let app = window.app_handle().clone();
+            let state = app.state::<BackendState>();
+            if state.closing.swap(true, Ordering::SeqCst) {
+                return;
+            }
+
+            api.prevent_close();
+            let window = window.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<BackendState>();
+                shutdown_backend_state(state.inner()).await;
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                let _ = window.close();
+            });
+        })
         .invoke_handler(tauri::generate_handler![
             start_backend,
             send_chat,
@@ -196,7 +237,8 @@ fn main() {
             skip,
             remove_queue_item,
             move_queue_item,
-            vote
+            vote,
+            shutdown_backend
         ])
         .setup(|app| {
             let main_window = app

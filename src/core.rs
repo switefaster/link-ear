@@ -274,6 +274,7 @@ pub enum NetworkCommand {
         to: usize,
     },
     Vote(bool),
+    Shutdown,
 }
 
 pub struct PendingPlayback {

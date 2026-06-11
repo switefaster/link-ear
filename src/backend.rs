@@ -60,8 +60,9 @@ const MUSIC_PREPARE_TIMEOUT: Duration = Duration::from_secs(12);
 const MUSIC_START_DELAY: Duration = Duration::from_millis(1500);
 const VOTE_TIMEOUT: Duration = Duration::from_secs(20);
 const RENDEZVOUS_DISCOVER_INTERVAL: Duration = Duration::from_secs(30);
-const RENDEZVOUS_REGISTER_INTERVAL: Duration = Duration::from_secs(60);
-const RENDEZVOUS_TTL_SECONDS: u64 = 180;
+const RENDEZVOUS_REGISTER_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const RENDEZVOUS_TTL_SECONDS: u64 = 60 * 60 * 2;
+const RENDEZVOUS_UNREGISTER_GRACE: Duration = Duration::from_millis(500);
 const ZERO_PEER_RECOVERY_TICK: Duration = Duration::from_secs(1);
 const ZERO_PEER_RECOVERY_DISCOVER_DELAYS: [Duration; 5] = [
     Duration::from_secs(0),
@@ -729,7 +730,26 @@ pub async fn run_network(
                     )
                     .await?;
                 }
-                None => break,
+                Some(NetworkCommand::Shutdown) => {
+                    unregister_from_rendezvous_nodes(
+                        &mut swarm,
+                        &rendezvous_nodes,
+                        &rendezvous_namespace,
+                        &ui,
+                    )
+                    .await;
+                    break;
+                }
+                None => {
+                    unregister_from_rendezvous_nodes(
+                        &mut swarm,
+                        &rendezvous_nodes,
+                        &rendezvous_namespace,
+                        &ui,
+                    )
+                    .await;
+                    break;
+                }
             },
             _ = music_local.tick() => {
                 let targets = PublishTargets {
@@ -1720,6 +1740,47 @@ async fn register_with_rendezvous_node(
                 format!("rendezvous register request failed {rendezvous_node}: {err:?}"),
             )
             .await;
+        }
+    }
+}
+
+async fn unregister_from_rendezvous_nodes(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    rendezvous_nodes: &HashSet<PeerId>,
+    namespace: &rendezvous::Namespace,
+    ui: &mpsc::Sender<UiEvent>,
+) {
+    let connected_nodes = rendezvous_nodes
+        .iter()
+        .copied()
+        .filter(|peer_id| is_peer_connected(swarm, *peer_id))
+        .collect::<Vec<_>>();
+    if connected_nodes.is_empty() {
+        return;
+    }
+
+    for rendezvous_node in connected_nodes {
+        swarm
+            .behaviour_mut()
+            .rendezvous
+            .unregister(namespace.clone(), rendezvous_node);
+        send_status(
+            ui,
+            format!("unregistering from rendezvous {rendezvous_node} in {namespace}"),
+        )
+        .await;
+    }
+
+    let grace = time::sleep(RENDEZVOUS_UNREGISTER_GRACE);
+    tokio::pin!(grace);
+    loop {
+        tokio::select! {
+            _ = &mut grace => break,
+            event = swarm.select_next_some() => {
+                if let SwarmEvent::Behaviour(BehaviourEvent::Rendezvous(event)) = event {
+                    send_status(ui, format!("rendezvous shutdown event: {event:?}")).await;
+                }
+            }
         }
     }
 }

@@ -21,6 +21,8 @@ use tracing_subscriber::EnvFilter;
 const EVENT_LOG_LIMIT: usize = 80;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SWARM_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(60 * 60 * 6);
+const RELAY_MAX_CIRCUIT_BYTES: u64 = 0;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Public link-ear relay and rendezvous node")]
@@ -311,9 +313,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_behaviour(|key| {
             let local_peer_id = key.public().to_peer_id();
             RelayBehaviour {
-                relay: relay::Behaviour::new(local_peer_id, relay::Config::default()),
+                relay: relay::Behaviour::new(
+                    local_peer_id,
+                    relay::Config {
+                        // 0 disables the byte cap in libp2p-relay; duration still needs a
+                        // positive timeout because 0 would fire the circuit timer immediately.
+                        max_circuit_duration: RELAY_MAX_CIRCUIT_DURATION,
+                        max_circuit_bytes: RELAY_MAX_CIRCUIT_BYTES,
+                        ..Default::default()
+                    },
+                ),
                 rendezvous: rendezvous::server::Behaviour::new(
-                    rendezvous::server::Config::default().with_min_ttl(120), //TODO: Burden the relay traffic? Gracefully unregister when quitting?
+                    rendezvous::server::Config::default(),
                 ),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/link-ear-relay/0.1.0".to_string(),
