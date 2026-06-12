@@ -20,7 +20,7 @@ pub(crate) struct BufferOperation {
     prepare_published_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BufferPeerStatus {
     pub(crate) status: PlaybackBufferStatusKind,
     pub(crate) buffered_until_ms: Option<u64>,
@@ -134,6 +134,29 @@ impl BufferCoordinator {
         (operation.operation_id == operation_id && operation.state.session_id == session_id)
             .then(|| operation.statuses.get(peer_id).cloned())
             .flatten()
+    }
+
+    pub(crate) fn status_matches(
+        &self,
+        operation_id: &str,
+        session_id: &str,
+        peer_id: &str,
+        status: &BufferPeerStatus,
+    ) -> bool {
+        let Some(operation) = self.active.as_ref() else {
+            return false;
+        };
+        if operation.operation_id != operation_id || operation.state.session_id != session_id {
+            return false;
+        }
+
+        operation.statuses.get(peer_id) == Some(status)
+    }
+
+    pub(crate) fn extend_active_deadline(&mut self, deadline: Instant) -> Option<BufferOperation> {
+        let operation = self.active.as_mut()?;
+        operation.deadline = deadline;
+        Some(operation.clone())
     }
 
     pub(crate) fn mark_prepare_published(&mut self, operation_id: &str, now: Instant) -> bool {
@@ -613,6 +636,89 @@ mod tests {
                 .map(|status| status.status),
             Some(PlaybackBufferStatusKind::Ready)
         );
+    }
+
+    #[test]
+    fn status_matches_detects_duplicate_peer_status() {
+        let now = Instant::now();
+        let mut coordinator = BufferCoordinator::new();
+        coordinator.receive_remote_operation(
+            "op".to_string(),
+            state("session"),
+            PlaybackBufferOperationKind::Resume,
+            peers(["local", "leader"]),
+            Duration::from_secs(10),
+            now,
+        );
+        let status = BufferPeerStatus {
+            status: PlaybackBufferStatusKind::Ready,
+            buffered_until_ms: Some(12_000),
+            error: None,
+        };
+
+        coordinator.mark_status(
+            "op",
+            "session",
+            "local",
+            status.status.clone(),
+            status.buffered_until_ms,
+            status.error.clone(),
+            now,
+        );
+
+        assert!(coordinator.status_matches("op", "session", "local", &status));
+        assert!(!coordinator.status_matches(
+            "op",
+            "session",
+            "local",
+            &BufferPeerStatus {
+                status: PlaybackBufferStatusKind::Buffering,
+                ..status
+            }
+        ));
+    }
+
+    #[test]
+    fn extending_deadline_keeps_slow_local_buffer_waiting() {
+        let now = Instant::now();
+        let mut coordinator = BufferCoordinator::new();
+        coordinator.start_leader_operation(
+            "op".to_string(),
+            state("session"),
+            PlaybackBufferOperationKind::Seek,
+            None,
+            peers(["local", "remote"]),
+            now + Duration::from_secs(1),
+        );
+        coordinator.mark_status(
+            "op",
+            "session",
+            "local",
+            PlaybackBufferStatusKind::Buffering,
+            Some(4_000),
+            None,
+            now,
+        );
+
+        assert!(matches!(
+            coordinator.quorum(now + Duration::from_secs(2)),
+            Some(BufferQuorum::TimedOut { .. })
+        ));
+
+        let extended = coordinator
+            .extend_active_deadline(now + Duration::from_secs(10))
+            .expect("active operation");
+
+        assert_eq!(extended.operation_id, "op");
+        assert!(matches!(
+            coordinator.quorum(now + Duration::from_secs(2)),
+            Some(BufferQuorum::Waiting {
+                ready: 0,
+                buffering: 1,
+                failed: 0,
+                threshold: 2
+            })
+        ));
     }
 
     #[test]

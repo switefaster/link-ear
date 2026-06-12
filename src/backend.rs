@@ -29,7 +29,9 @@ use tokio::{
 
 use crate::{
     bilibili,
-    buffer_state::{BufferCoordinator, BufferOperation, BufferQuorum},
+    buffer_state::{
+        BufferCoordinator, BufferOperation, BufferPeerStatus, BufferQuorum, BufferStatusOutcome,
+    },
     connection_state::{
         ConnectionEffect, ConnectionState, DIRECT_PROMOTION_RETRY_INTERVAL,
         GOSSIP_WARMUP_CHECK_INTERVAL, RelayCloseReason, is_relay_address, normalize_peer_address,
@@ -2567,7 +2569,6 @@ async fn apply_wire_message(
                     local_status.error,
                 )
                 .ok();
-                send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
                 return true;
             }
 
@@ -2678,7 +2679,18 @@ async fn apply_wire_message(
             error,
             ..
         } => {
-            let _ = ctx.buffer_coordinator.mark_status(
+            let peer_status = BufferPeerStatus {
+                status: status.clone(),
+                buffered_until_ms,
+                error: error.clone(),
+            };
+            let duplicate_status = ctx.buffer_coordinator.status_matches(
+                &operation_id,
+                &session_id,
+                &peer_id,
+                &peer_status,
+            );
+            let status_outcome = ctx.buffer_coordinator.mark_status(
                 &operation_id,
                 &session_id,
                 &peer_id,
@@ -2707,7 +2719,9 @@ async fn apply_wire_message(
                     send_status(ui, format!("buffer operation failed: {err:#}")).await;
                 }
             }
-            send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
+            if !duplicate_status && !matches!(status_outcome, BufferStatusOutcome::Ignored) {
+                send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
+            }
             true
         }
         WireMessage::PlaybackBufferCancel {
@@ -3892,6 +3906,47 @@ async fn resolve_buffer_operation(
             }
         }
         BufferQuorum::TimedOut { ready, threshold } => {
+            let local_peer = local_peer_id.to_string();
+            let local_status = buffer
+                .active()
+                .and_then(|operation| operation.statuses.get(&local_peer).cloned());
+            if local_status
+                .as_ref()
+                .is_some_and(|status| status.status == PlaybackBufferStatusKind::Buffering)
+            {
+                if let Some(operation) =
+                    buffer.extend_active_deadline(now + BUFFER_OPERATION_TIMEOUT)
+                {
+                    publish_playback_buffer_prepare(
+                        swarm,
+                        topic,
+                        targets,
+                        &operation,
+                        local_peer_id,
+                    )?;
+                    let _ = buffer.mark_prepare_published(&operation.operation_id, now);
+                    if let Some(status) = local_status {
+                        publish_playback_buffer_status(
+                            swarm,
+                            topic,
+                            targets,
+                            &operation.operation_id,
+                            &operation.state.session_id,
+                            local_peer_id,
+                            status.status,
+                            status.buffered_until_ms,
+                            status.error,
+                        )?;
+                    }
+                    send_buffer_view(ui, buffer, local_peer_id).await;
+                    send_status(
+                        ui,
+                        format!("local buffer still loading; extended wait ({ready}/{threshold})"),
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
             let Some(operation) = buffer.clear() else {
                 return Ok(());
             };
