@@ -13,14 +13,14 @@ flowchart LR
     Backend -->|FrontendEvent| Tauri
     Tauri -->|backend-event| UI
 
-    Backend -->|gossipsub + direct fallback| Room["Room peers"]
+    Backend -->|gossipsub topic| Room["Room peers"]
     Backend -->|rendezvous register/discover| Relay["Relay/rendezvous node"]
     Room -->|relay circuit when needed| Relay
     Backend -->|HTTP resolve/download| Bili["Bilibili"]
     Backend -->|decoded local audio| Player["AudioPlayer"]
 ```
 
-The desktop path is the primary product path. The terminal UI still exists as a legacy/debug entrypoint and should keep compiling.
+The desktop path is the primary product path. The legacy terminal UI has been removed; the root crate now builds the backend library plus the relay/rendezvous binary.
 
 ## Runtime Processes
 
@@ -67,7 +67,7 @@ The desktop path is the primary product path. The terminal UI still exists as a 
 
 `run_network` is the external backend entrypoint. It builds the libp2p swarm, sets timers, listens/dials configured addresses, and then handles these inputs in one async loop:
 
-- `NetworkCommand` from Tauri/legacy UI.
+- `NetworkCommand` from the Tauri bridge.
 - libp2p `SwarmEvent`.
 - periodic history/queue summary sync.
 - periodic playback state publication by the playback leader.
@@ -80,14 +80,11 @@ The event loop should stay responsive. Long Bilibili audio downloads are schedul
 
 ## Wire Messages And Source Validation
 
-Room protocol messages are `WireMessage` values serialized as JSON. They flow over:
+Room protocol messages are `WireMessage` values serialized as JSON. They flow over the room gossipsub topic only.
 
-- gossipsub topic publish, when the topic has peers;
-- direct request-response fallback, only when gossipsub reports no subscribed peers for the topic or when a targeted sync request needs a specific peer.
+`HistoryRequest`, `HistoryResponse`, `QueueRequest`, and `QueueResponse` keep their `target` fields, but they are still broadcast over gossipsub and ignored by non-target peers. If gossipsub reports `NoPeersSubscribedToTopic`, the backend reports a status error and does not attempt direct request-response fallback.
 
-Direct fallback is a reliability fallback, not a second broadcast channel. Do not dual-send if gossipsub publish succeeds.
-
-Inbound gossipsub and direct messages reuse the same wire-message handler. Actor fields are validated against the authenticated source peer:
+Inbound gossipsub messages use source validation against the authenticated source peer:
 
 - chat/name/history summary/request actors must match the source;
 - queue state `updated_by` must match the source;

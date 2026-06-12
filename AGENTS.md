@@ -15,8 +15,6 @@ connections when direct addresses become usable so relay traffic stays bounded.
 - `src/backend.rs`: main libp2p runtime, protocol message handling, history sync,
   queue sync, voting, playback state sync, relay-to-direct promotion.
 - `src/core.rs`: shared protocol and UI-facing data types plus small utilities.
-- `src/main.rs`: legacy terminal UI bootstrap and command parsing. Keep it
-  compiling for now, but desktop/Tauri is the primary user-facing path.
 - `src/bin/link-ear-relay.rs`: public relay/rendezvous node plus topology
   dashboard.
 - `src-tauri/src/main.rs`: Tauri command bridge into the Rust backend.
@@ -25,8 +23,7 @@ connections when direct addresses become usable so relay traffic stays bounded.
   timing assumptions, and change guidance.
 - `.github/workflows/build.yml`: push-triggered matrix CI build for Windows,
   Linux, and macOS. It runs frontend/Rust checks and builds the relay binary
-  plus Tauri desktop bundle, but does not upload artifacts or build the legacy
-  TUI binary.
+  plus Tauri desktop bundle, but does not upload artifacts.
 
 ## Useful checks
 
@@ -104,13 +101,13 @@ guardrail:
   source peer.
 - Vote thresholds and playback ready expected peers count real room peers only:
   include the local peer, exclude relay/rendezvous infrastructure peers.
-- Gossipsub publish paths for chat, history sync, queue sync, playback, and
-  votes should keep direct-message fallback working for connected room peers.
-- Direct-message fallback is only a reliability fallback for
-  `NoPeersSubscribedToTopic`; do not dual-send when gossipsub publish succeeds
-  or returns duplicate noise. Direct inbound messages should reuse the normal
-  `WireMessage` handler and reject actor fields that do not match the
-  authenticated source peer.
+- Room protocol messages for chat, history sync, queue sync, playback, buffer
+  coordination, and votes are gossipsub-only. Do not add direct-message fallback
+  or request-response delivery for room messages.
+- Treat `NoPeersSubscribedToTopic` and gossipsub unsupported/unsubscribed peers
+  as visible readiness problems. Report actionable status, keep peer overview
+  `chat_subscribed` strict, and let history/queue sync retry when subscription
+  readiness returns.
 - Direct promotion should not close relay links immediately on the same tick as
   a new direct connection. Keep relay during the short handoff grace period; if
   direct drops during that window, relay remains the reliability path.
@@ -126,9 +123,9 @@ guardrail:
   it UI-facing only: route type, direct/relay link counts, known direct address
   count, chat subscription readiness, and direct promotion counters must not be
   added to the P2P wire schema.
-- Direct fallback for targeted history/queue sync requests should send only to
-  the target peer. Track request-response failures for those fallback requests
-  and clear the matching request cooldown so slow peers can retry sync.
+- Targeted history/queue sync requests still use existing `target` fields, but
+  they are broadcast over gossipsub and ignored by non-target peers. Do not set
+  request cooldowns when publish fails because no peers are subscribed.
 - Rendezvous registration TTL should follow the libp2p default floor of about
   two hours to avoid noisy refresh traffic. Clients should unregister from
   rendezvous on graceful shutdown; crashed clients may remain discoverable until
