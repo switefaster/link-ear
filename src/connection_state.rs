@@ -206,6 +206,7 @@ impl ConnectionState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn routes(&self) -> &HashMap<PeerId, PeerConnectionRoutes> {
         &self.routes
     }
@@ -489,14 +490,14 @@ impl ConnectionState {
     }
 
     pub(crate) fn chat_unsubscribed(&mut self, peer_id: PeerId) -> Vec<ConnectionEffect> {
+        self.chat_subscribers.remove(&peer_id);
         if self.routes.contains_key(&peer_id) {
             self.relay_handoffs.remove(&peer_id);
             return vec![ConnectionEffect::Status(format!(
-                "peer {peer_id} chat unsubscribe observed while still connected; keeping readiness until disconnect"
+                "peer {peer_id} unsubscribed from chat while still connected; room messages require gossipsub readiness"
             ))];
         }
 
-        self.chat_subscribers.remove(&peer_id);
         vec![ConnectionEffect::Status(format!(
             "peer {peer_id} unsubscribed from chat"
         ))]
@@ -1084,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn unsubscribe_while_connected_does_not_clear_chat_readiness() {
+    fn unsubscribe_while_connected_clears_chat_readiness() {
         let local = peer_id();
         let peer = peer_id();
         let now = Instant::now();
@@ -1095,11 +1096,11 @@ mod tests {
 
         let effects = state.chat_unsubscribed(peer);
 
-        assert!(state.is_chat_subscribed(peer));
+        assert!(!state.is_chat_subscribed(peer));
         assert!(
             status_text(&effects)
                 .iter()
-                .any(|status| status.contains("still connected"))
+                .any(|status| status.contains("room messages require gossipsub readiness"))
         );
     }
 

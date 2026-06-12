@@ -21,9 +21,9 @@ run.
 | Track finishes but followers stay paused at the end | Finished playback roles distinguish leader/follower; covered by `finished_playback_role_distinguishes_leader_and_follower`. |
 | Direct promotion failure breaks relay delivery | Connection policy keeps relay route after direct failure; covered by `direct_promotion_failure_keeps_relay_route_available`. |
 | Direct route drops immediately after relay close | Direct promotion now keeps relay through a handoff grace period and cancels relay close if direct drops; covered by `chat_subscription_schedules_relay_handoff_when_direct_route_exists` and `direct_handoff_keeps_relay_if_direct_drops_before_grace`. |
-| Gossipsub readiness falls back to wait after connection churn | Connected-peer unsubscribe events no longer clear readiness until the peer fully disconnects; covered by `unsubscribe_while_connected_does_not_clear_chat_readiness`. |
-| Direct fallback is too broad or spoofable | Fallback is reserved for `NoPeersSubscribedToTopic`, targeted sync requests send only to the requested peer, and direct inbound messages use the normal validated `WireMessage` handler. |
-| Slow peers fail history sync and cannot retry | History summary considers count or newest timestamp, and failed direct sync clears matching cooldown; covered by `history_summary_newer_uses_count_or_newest_timestamp` and `direct_sync_failure_clears_matching_request_cooldown`. |
+| Gossipsub readiness falls back to wait after connection churn | Connected-peer unsubscribe events now clear readiness immediately so the peer overview shows `wait`; covered by `unsubscribe_while_connected_clears_chat_readiness`. |
+| Direct fallback is too broad or spoofable | Direct message fallback has been removed. Room messages are gossipsub-only; targeted sync uses existing `target` fields and non-target peers ignore the message. |
+| Slow peers fail history sync and cannot retry | History summary considers count or newest timestamp, and gossipsub no-subscriber publish failures do not consume request cooldowns. |
 | Basic multi-backend chat/history convergence | `local_loopback_smoke_syncs_chat_history_between_two_backends` starts two real backend event loops on loopback, dials one into the other, sends chat, and verifies both history views converge. |
 | Dragging queue order does not work | Desktop queue cards support pointer drag plus keyboard move controls that open move vote confirmation. |
 | Insert-at-position should be removed | Desktop enqueue form has no position field; backend ignores `position` and always appends; README marks `/insert` as compatibility only. |
@@ -66,11 +66,12 @@ These cannot be fully proven inside a single local compile/test run:
 - Three-person room with one relay-only peer, one direct-capable peer, and one
   slower peer.
 - Actual relay/rendezvous reachability across mixed NATs.
-- Real gossipsub delivery versus direct fallback under subscriber churn.
+- Real gossipsub-only delivery under subscriber churn.
 - Audio download and synchronized playback behavior across different machines.
 - UI behavior under the users' actual IME/browser/WebView environment.
 
 Use `docs/manual-smoke-test.md` to collect that evidence. Do not mark the
 stabilization effort complete until a real run confirms chat, history sync,
 queue/vote convergence, playback readiness, direct-promotion failure fallback,
-peer overview, status log filtering, duplicate names, and IME input.
+peer overview, gossipsub readiness errors, status log filtering, duplicate
+names, and IME input.

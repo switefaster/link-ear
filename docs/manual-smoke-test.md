@@ -45,9 +45,12 @@ overview shows `direct`, `relay`, or `direct+relay`.
 - The relay dashboard shows rendezvous registrations for the topic.
 - Peer overview marks the relay/rendezvous node as infrastructure, not a room
   peer.
+- Peer overview shows every connected room peer as chat `ready` before testing
+  queue, playback, or vote propagation.
 - Chat messages from every peer are visible on every other peer.
-- If a peer sees `gossipsub has no chat subscribers; sent direct fallback`,
-  the receiving peer should still get the message or sync within a few seconds.
+- If a peer sees a gossipsub unsupported, unsubscribed, or no-subscribers
+  status, treat that peer as not ready; room messages no longer use direct
+  fallback.
 
 ## Chat And History
 
@@ -59,7 +62,7 @@ overview shows `direct`, `relay`, or `direct+relay`.
 Pass signals:
 
 - Peer C receives the missing messages without requiring a restart.
-- Logs show history summary/request/response activity or direct fallback.
+- Logs show history summary/request/response activity over gossipsub.
 - Duplicate messages do not appear.
 - The chat history panel can scroll back to older messages.
 
@@ -67,7 +70,7 @@ Capture on failure:
 
 - Local peer id for every peer.
 - Last history-related log entries.
-- Whether direct fallback requests were targeted to the expected peer.
+- Whether peer overview showed the expected target peer as chat `ready`.
 
 ## Queue Rules
 

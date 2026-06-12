@@ -13,8 +13,8 @@ use anyhow::{Result, anyhow};
 use chrono::Local;
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, SwarmBuilder, dcutr, gossipsub, identify, mdns, noise, ping,
-    relay, rendezvous, request_response,
+    Multiaddr, PeerId, SwarmBuilder, dcutr, gossipsub, identify, mdns, noise, ping, relay,
+    rendezvous,
     swarm::{
         NetworkBehaviour, SwarmEvent,
         behaviour::toggle::Toggle,
@@ -22,7 +22,6 @@ use libp2p::{
     },
     tcp, yamux,
 };
-use serde::{Deserialize, Serialize};
 use tokio::{
     sync::mpsc,
     time::{self, Instant, MissedTickBehavior},
@@ -33,8 +32,8 @@ use crate::{
     buffer_state::{BufferCoordinator, BufferOperation, BufferQuorum},
     connection_state::{
         ConnectionEffect, ConnectionState, DIRECT_PROMOTION_RETRY_INTERVAL,
-        GOSSIP_WARMUP_CHECK_INTERVAL, PeerConnectionRoutes, RelayCloseReason, is_relay_address,
-        normalize_peer_address, peer_id_from_multiaddr, prioritize_multiaddrs,
+        GOSSIP_WARMUP_CHECK_INTERVAL, RelayCloseReason, is_relay_address, normalize_peer_address,
+        peer_id_from_multiaddr, prioritize_multiaddrs,
     },
     core::{
         ChatRecord, FrontendEvent as UiEvent, MAX_MESSAGES, NetworkCommand, PeerNameClaim,
@@ -77,7 +76,6 @@ const ZERO_PEER_RECOVERY_DISCOVER_DELAYS: [Duration; 5] = [
     Duration::from_secs(30),
 ];
 const SWARM_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const DIRECT_MESSAGE_PROTOCOL: &str = "/link-ear/direct-message/0.1.0";
 static NONCE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub struct BackendConfig {
@@ -92,7 +90,6 @@ pub struct BackendConfig {
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     gossipsub: gossipsub::Behaviour,
-    direct_messages: request_response::json::Behaviour<DirectMessageRequest, DirectMessageResponse>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     relay: relay::client::Behaviour,
@@ -101,34 +98,20 @@ struct Behaviour {
     mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DirectMessageRequest {
-    topic: String,
-    message: WireMessage,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DirectMessageResponse {
-    accepted: bool,
-}
-
 struct PublishTargets<'a> {
-    topic_name: &'a str,
-    peer_routes: &'a HashMap<PeerId, PeerConnectionRoutes>,
     rendezvous_nodes: &'a HashSet<PeerId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoomPublishOutcome {
     Published,
-    DirectFallback(usize),
-    NoPeers,
+    NoSubscribers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoomPublishPlan {
     Published,
-    DirectFallback,
+    NoSubscribers,
     Failed,
 }
 
@@ -145,12 +128,6 @@ struct AudioDownloadResult {
     track_id: String,
     title: String,
     audio: std::result::Result<Vec<u8>, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PendingDirectSyncRequest {
-    History { peer_id: String },
-    Queue { peer_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +202,6 @@ pub async fn run_network(
     let mut peer_names = HashMap::new();
     let mut history_request_times = HashMap::new();
     let mut queue_request_times = HashMap::new();
-    let mut pending_direct_sync_requests = HashMap::new();
     let mut pending_sync_summaries = VecDeque::new();
     let mut rendezvous_nodes = HashSet::new();
     let mut rendezvous_cookies = HashMap::new();
@@ -279,13 +255,6 @@ pub async fn run_network(
             |key, relay| -> Result<Behaviour, Box<dyn std::error::Error + Send + Sync>> {
                 let peer_id = key.public().to_peer_id();
                 let gossipsub = build_gossipsub(key)?;
-                let direct_messages = request_response::json::Behaviour::new(
-                    [(
-                        StreamProtocol::new(DIRECT_MESSAGE_PROTOCOL),
-                        request_response::ProtocolSupport::Full,
-                    )],
-                    request_response::Config::default(),
-                );
                 let identify = identify::Behaviour::new(identify::Config::new(
                     "/link-ear/0.1.0".to_string(),
                     key.public(),
@@ -301,7 +270,6 @@ pub async fn run_network(
 
                 Ok(Behaviour {
                     gossipsub,
-                    direct_messages,
                     identify,
                     ping: ping::Behaviour::default(),
                     relay,
@@ -406,23 +374,12 @@ pub async fn run_network(
                         sent_at,
                     };
                     let targets = PublishTargets {
-                        topic_name: &config.topic,
-                        peer_routes: connections.routes(),
                         rendezvous_nodes: &rendezvous_nodes,
                     };
                     match publish_chat_wire(&mut swarm, &topic, &targets, &msg) {
                         Ok(RoomPublishOutcome::Published) => {}
-                        Ok(RoomPublishOutcome::DirectFallback(direct_count)) => {
-                            send_status(
-                                &ui,
-                                format!(
-                                    "gossipsub has no chat subscribers; sent direct fallback to {direct_count} peer(s)"
-                                ),
-                            )
-                            .await;
-                        }
-                        Ok(RoomPublishOutcome::NoPeers) => {
-                            send_status(&ui, "publish failed: NoPeersSubscribedToTopic".to_string()).await;
+                        Ok(RoomPublishOutcome::NoSubscribers) => {
+                            send_status(&ui, "gossipsub publish failed: no peers subscribed to the room topic".to_string()).await;
                         }
                         Err(err) => {
                             send_status(&ui, format!("publish failed: {err}")).await;
@@ -446,8 +403,6 @@ pub async fn run_network(
                             let title = item.track.title.clone();
                             let index = music.append_queue_item(item);
                             let targets = PublishTargets {
-                                topic_name: &config.topic,
-                                peer_routes: connections.routes(),
                                 rendezvous_nodes: &rendezvous_nodes,
                             };
                             publish_queue_state(
@@ -489,8 +444,6 @@ pub async fn run_network(
                         send_status(&ui, "no active playback".to_string()).await;
                     } else {
                         let targets = PublishTargets {
-                            topic_name: &config.topic,
-                            peer_routes: connections.routes(),
                             rendezvous_nodes: &rendezvous_nodes,
                         };
                         let room_peer_total =
@@ -510,7 +463,6 @@ pub async fn run_network(
                             local_peer_id,
                             room_peer_total,
                             &mut queue_request_times,
-                            &mut pending_direct_sync_requests,
                             &ui,
                         )
                         .await?;
@@ -521,8 +473,6 @@ pub async fn run_network(
                         send_status(&ui, "no active playback".to_string()).await;
                     } else {
                         let targets = PublishTargets {
-                            topic_name: &config.topic,
-                            peer_routes: connections.routes(),
                             rendezvous_nodes: &rendezvous_nodes,
                         };
                         let room_peer_total =
@@ -542,7 +492,6 @@ pub async fn run_network(
                             local_peer_id,
                             room_peer_total,
                             &mut queue_request_times,
-                            &mut pending_direct_sync_requests,
                             &ui,
                         )
                         .await?;
@@ -554,8 +503,6 @@ pub async fn run_network(
                     } else {
                         let now = current_timestamp_micros();
                         let targets = PublishTargets {
-                            topic_name: &config.topic,
-                            peer_routes: connections.routes(),
                             rendezvous_nodes: &rendezvous_nodes,
                         };
                         let room_peer_total =
@@ -612,7 +559,6 @@ pub async fn run_network(
                                 local_peer_id,
                                 room_peer_total,
                                 &mut queue_request_times,
-                                &mut pending_direct_sync_requests,
                                 &ui,
                             )
                             .await?;
@@ -630,8 +576,6 @@ pub async fn run_network(
                         send_status(&ui, "no active playback".to_string()).await;
                     } else {
                         let targets = PublishTargets {
-                            topic_name: &config.topic,
-                            peer_routes: connections.routes(),
                             rendezvous_nodes: &rendezvous_nodes,
                         };
                         let room_peer_total =
@@ -651,7 +595,6 @@ pub async fn run_network(
                             local_peer_id,
                             room_peer_total,
                             &mut queue_request_times,
-                            &mut pending_direct_sync_requests,
                             &ui,
                         )
                         .await?;
@@ -664,8 +607,6 @@ pub async fn run_network(
                             let title = item.track.title.clone();
                             music.remove_queue_index(index);
                             let targets = PublishTargets {
-                                topic_name: &config.topic,
-                                peer_routes: connections.routes(),
                                 rendezvous_nodes: &rendezvous_nodes,
                             };
                             publish_queue_state(
@@ -680,8 +621,6 @@ pub async fn run_network(
                         }
                         Some(item) => {
                             let targets = PublishTargets {
-                                topic_name: &config.topic,
-                                peer_routes: connections.routes(),
                                 rendezvous_nodes: &rendezvous_nodes,
                             };
                             let room_peer_total =
@@ -703,7 +642,6 @@ pub async fn run_network(
                                 local_peer_id,
                                 room_peer_total,
                                 &mut queue_request_times,
-                                &mut pending_direct_sync_requests,
                                 &ui,
                             )
                             .await?;
@@ -715,8 +653,6 @@ pub async fn run_network(
                     match queue_item_at(&music.queue, from) {
                         Some(item) => {
                             let targets = PublishTargets {
-                                topic_name: &config.topic,
-                                peer_routes: connections.routes(),
                                 rendezvous_nodes: &rendezvous_nodes,
                             };
                             let room_peer_total =
@@ -739,7 +675,6 @@ pub async fn run_network(
                                 local_peer_id,
                                 room_peer_total,
                                 &mut queue_request_times,
-                                &mut pending_direct_sync_requests,
                                 &ui,
                             )
                             .await?;
@@ -749,8 +684,6 @@ pub async fn run_network(
                 }
                 Some(NetworkCommand::Vote(approve)) => {
                     let targets = PublishTargets {
-                        topic_name: &config.topic,
-                        peer_routes: connections.routes(),
                         rendezvous_nodes: &rendezvous_nodes,
                     };
                     let room_peer_total = room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
@@ -769,7 +702,6 @@ pub async fn run_network(
                         local_peer_id,
                         room_peer_total,
                         &mut queue_request_times,
-                        &mut pending_direct_sync_requests,
                         &ui,
                     )
                     .await?;
@@ -797,8 +729,6 @@ pub async fn run_network(
             },
             _ = music_local.tick() => {
                 let targets = PublishTargets {
-                    topic_name: &config.topic,
-                    peer_routes: connections.routes(),
                     rendezvous_nodes: &rendezvous_nodes,
                 };
                 let room_peer_total = room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
@@ -828,7 +758,6 @@ pub async fn run_network(
                     local_peer_id,
                     room_peer_total,
                     &mut queue_request_times,
-                    &mut pending_direct_sync_requests,
                     &ui,
                 )
                 .await
@@ -991,8 +920,6 @@ pub async fn run_network(
             },
             _ = history_sync.tick() => {
                 let targets = PublishTargets {
-                    topic_name: &config.topic,
-                    peer_routes: connections.routes(),
                     rendezvous_nodes: &rendezvous_nodes,
                 };
                 if let Err(err) = publish_sync_summary(
@@ -1012,8 +939,6 @@ pub async fn run_network(
             },
             _ = history_sync_burst.tick() => {
                 let targets = PublishTargets {
-                    topic_name: &config.topic,
-                    peer_routes: connections.routes(),
                     rendezvous_nodes: &rendezvous_nodes,
                 };
                 if let Err(err) = publish_pending_sync_summaries(
@@ -1048,8 +973,6 @@ pub async fn run_network(
                     }
                     if let Some(state) = state_to_publish {
                         let targets = PublishTargets {
-                            topic_name: &config.topic,
-                            peer_routes: connections.routes(),
                             rendezvous_nodes: &rendezvous_nodes,
                         };
                         publish_playback_state(&mut swarm, &topic, &targets, &state)?;
@@ -1115,8 +1038,6 @@ pub async fn run_network(
                     &download.session_id,
                 ));
                 let targets = PublishTargets {
-                    topic_name: &config.topic,
-                    peer_routes: connections.routes(),
                     rendezvous_nodes: &rendezvous_nodes,
                 };
                 if let Err(err) = handle_audio_download_result(
@@ -1142,7 +1063,6 @@ pub async fn run_network(
             event = swarm.select_next_some() => {
                 let ctx = HistoryContext {
                     topic: &topic,
-                    topic_name: &config.topic,
                     local_peer_id,
                     history: &mut history,
                     seen_messages: &mut seen_messages,
@@ -1151,7 +1071,6 @@ pub async fn run_network(
                     peer_names: &mut peer_names,
                     history_request_times: &mut history_request_times,
                     queue_request_times: &mut queue_request_times,
-                    pending_direct_sync_requests: &mut pending_direct_sync_requests,
                     pending_sync_summaries: &mut pending_sync_summaries,
                     http_client: &http_client,
                     audio_download_tx: &audio_download_tx,
@@ -1204,7 +1123,6 @@ fn build_gossipsub(
 
 struct HistoryContext<'a> {
     topic: &'a gossipsub::IdentTopic,
-    topic_name: &'a str,
     local_peer_id: PeerId,
     history: &'a mut Vec<ChatRecord>,
     seen_messages: &'a mut HashSet<String>,
@@ -1213,8 +1131,6 @@ struct HistoryContext<'a> {
     peer_names: &'a mut HashMap<String, PeerNameClaim>,
     history_request_times: &'a mut HashMap<String, Instant>,
     queue_request_times: &'a mut HashMap<String, Instant>,
-    pending_direct_sync_requests:
-        &'a mut HashMap<request_response::OutboundRequestId, PendingDirectSyncRequest>,
     pending_sync_summaries: &'a mut VecDeque<Instant>,
     http_client: &'a reqwest::Client,
     audio_download_tx: &'a mpsc::Sender<AudioDownloadResult>,
@@ -1363,11 +1279,7 @@ async fn handle_swarm_event(
                 .await;
             }
 
-            let targets = PublishTargets {
-                topic_name: ctx.topic_name,
-                peer_routes: connections.routes(),
-                rendezvous_nodes,
-            };
+            let targets = PublishTargets { rendezvous_nodes };
             let count = connected_room_peer_count(swarm, rendezvous_nodes);
             let _ = ui.send(UiEvent::PeerCount(count)).await;
             if count > 0 && !rendezvous_nodes.contains(&peer_id) && zero_peer_recovery.finish() {
@@ -1418,11 +1330,7 @@ async fn handle_swarm_event(
                 }
                 let peer_id = peer_id.to_string();
                 ctx.music.remove_pending_peer(&peer_id);
-                let targets = PublishTargets {
-                    topic_name: ctx.topic_name,
-                    peer_routes: connections.routes(),
-                    rendezvous_nodes,
-                };
+                let targets = PublishTargets { rendezvous_nodes };
                 if let Err(err) = maybe_start_pending_playback(
                     ctx.music,
                     swarm,
@@ -1451,11 +1359,7 @@ async fn handle_swarm_event(
                 send_status(ui, format!("mDNS discovered {peer_id}")).await;
             }
             if discovered {
-                let targets = PublishTargets {
-                    topic_name: ctx.topic_name,
-                    peer_routes: connections.routes(),
-                    rendezvous_nodes,
-                };
+                let targets = PublishTargets { rendezvous_nodes };
                 if let Err(err) = trigger_sync(swarm, &targets, &mut ctx) {
                     send_status(ui, format!("sync summary failed: {err}")).await;
                 }
@@ -1578,11 +1482,7 @@ async fn handle_swarm_event(
             if topic == ctx.topic.hash() {
                 let effects = connections.chat_subscribed(peer_id, Instant::now());
                 apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects).await;
-                let targets = PublishTargets {
-                    topic_name: ctx.topic_name,
-                    peer_routes: connections.routes(),
-                    rendezvous_nodes,
-                };
+                let targets = PublishTargets { rendezvous_nodes };
                 if let Err(err) = trigger_sync(swarm, &targets, &mut ctx) {
                     send_status(ui, format!("sync summary failed: {err}")).await;
                 }
@@ -1600,7 +1500,11 @@ async fn handle_swarm_event(
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
             gossipsub::Event::GossipsubNotSupported { peer_id },
         )) => {
-            send_status(ui, format!("peer {peer_id} does not support gossipsub")).await;
+            send_status(
+                ui,
+                format!("peer {peer_id} cannot receive room messages: gossipsub is not supported"),
+            )
+            .await;
         }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::SlowPeer {
             peer_id,
@@ -1612,88 +1516,6 @@ async fn handle_swarm_event(
             )
             .await;
         }
-        SwarmEvent::Behaviour(BehaviourEvent::DirectMessages(
-            request_response::Event::Message { peer, message, .. },
-        )) => match message {
-            request_response::Message::Request {
-                request, channel, ..
-            } => {
-                let accepted = apply_direct_wire_message(
-                    peer,
-                    request.topic,
-                    request.message,
-                    swarm,
-                    connections,
-                    rendezvous_nodes,
-                    ui,
-                    &mut ctx,
-                )
-                .await;
-                if swarm
-                    .behaviour_mut()
-                    .direct_messages
-                    .send_response(channel, DirectMessageResponse { accepted })
-                    .is_err()
-                {
-                    send_status(ui, format!("direct response failed {peer}: channel closed")).await;
-                }
-            }
-            request_response::Message::Response {
-                request_id,
-                response,
-                ..
-            } => {
-                let pending_sync = ctx.pending_direct_sync_requests.remove(&request_id);
-                if !response.accepted {
-                    if let Some(pending_sync) = pending_sync {
-                        let (kind, peer_id) = clear_direct_sync_cooldown(
-                            pending_sync,
-                            ctx.history_request_times,
-                            ctx.queue_request_times,
-                        );
-                        send_status(
-                            ui,
-                            format!(
-                                "direct {kind} sync request to {} was rejected; retry remains eligible",
-                                short_peer(&peer_id)
-                            ),
-                        )
-                        .await;
-                    }
-                    send_status(ui, format!("direct message ignored by {peer}")).await;
-                }
-            }
-        },
-        SwarmEvent::Behaviour(BehaviourEvent::DirectMessages(
-            request_response::Event::OutboundFailure {
-                peer,
-                request_id,
-                error,
-                ..
-            },
-        )) => {
-            if let Some(pending_sync) = ctx.pending_direct_sync_requests.remove(&request_id) {
-                let (kind, peer_id) = clear_direct_sync_cooldown(
-                    pending_sync,
-                    ctx.history_request_times,
-                    ctx.queue_request_times,
-                );
-                send_status(
-                    ui,
-                    format!(
-                        "direct {kind} sync request to {} failed; retry remains eligible",
-                        short_peer(&peer_id)
-                    ),
-                )
-                .await;
-            }
-            send_status(ui, format!("direct message failed {peer}: {error}")).await;
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::DirectMessages(
-            request_response::Event::InboundFailure { peer, error, .. },
-        )) => {
-            send_status(ui, format!("direct message inbound failed {peer}: {error}")).await;
-        }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source,
             message,
@@ -1701,16 +1523,8 @@ async fn handle_swarm_event(
         })) => match serde_json::from_slice::<WireMessage>(&message.data) {
             Ok(wire) => {
                 let source_peer_id = message.source.unwrap_or(propagation_source);
-                apply_wire_message(
-                    source_peer_id,
-                    wire,
-                    swarm,
-                    connections,
-                    rendezvous_nodes,
-                    ui,
-                    &mut ctx,
-                )
-                .await;
+                apply_wire_message(source_peer_id, wire, swarm, rendezvous_nodes, ui, &mut ctx)
+                    .await;
             }
             Err(err) => send_status(ui, format!("ignored invalid message: {err}")).await,
         },
@@ -2268,42 +2082,10 @@ fn publish_pending_sync_summaries(
     Ok(())
 }
 
-async fn apply_direct_wire_message(
-    source_peer_id: PeerId,
-    topic_name: String,
-    message: WireMessage,
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    connections: &ConnectionState,
-    rendezvous_nodes: &HashSet<PeerId>,
-    ui: &mpsc::Sender<UiEvent>,
-    ctx: &mut HistoryContext<'_>,
-) -> bool {
-    if topic_name != ctx.topic_name {
-        send_status(
-            ui,
-            format!("ignored direct message from {source_peer_id}: topic mismatch"),
-        )
-        .await;
-        return false;
-    }
-
-    apply_wire_message(
-        source_peer_id,
-        message,
-        swarm,
-        connections,
-        rendezvous_nodes,
-        ui,
-        ctx,
-    )
-    .await
-}
-
 async fn apply_wire_message(
     source_peer_id: PeerId,
     message: WireMessage,
     swarm: &mut libp2p::Swarm<Behaviour>,
-    connections: &ConnectionState,
     rendezvous_nodes: &HashSet<PeerId>,
     ui: &mpsc::Sender<UiEvent>,
     ctx: &mut HistoryContext<'_>,
@@ -2317,11 +2099,7 @@ async fn apply_wire_message(
         return false;
     }
 
-    let targets = PublishTargets {
-        topic_name: ctx.topic_name,
-        peer_routes: connections.routes(),
-        rendezvous_nodes,
-    };
+    let targets = PublishTargets { rendezvous_nodes };
 
     match message {
         WireMessage::Chat {
@@ -2387,26 +2165,21 @@ async fn apply_wire_message(
                     nonce: new_nonce(ctx.local_peer_id),
                 };
 
-                match publish_room_wire_with_fallback(
-                    swarm,
-                    ctx.topic,
-                    &targets,
-                    &request,
-                    Some(ctx.pending_direct_sync_requests),
-                ) {
-                    Ok(outcome) if room_publish_reached_peer(outcome) => {
+                match publish_room_wire_with_outcome(swarm, ctx.topic, &request) {
+                    Ok(RoomPublishOutcome::Published) => {
                         ctx.history_request_times
                             .insert(peer_id.clone(), Instant::now());
                         send_status(ui, format!("requesting history from {peer_id}")).await;
                     }
-                    Ok(RoomPublishOutcome::NoPeers) => {
+                    Ok(RoomPublishOutcome::NoSubscribers) => {
                         send_status(
                             ui,
-                            format!("history request for {peer_id} not sent: no reachable peers"),
+                            format!(
+                                "history request for {peer_id} not sent: no gossipsub subscribers"
+                            ),
                         )
                         .await;
                     }
-                    Ok(RoomPublishOutcome::Published | RoomPublishOutcome::DirectFallback(_)) => {}
                     Err(err) => {
                         send_status(ui, format!("history request failed: {err}")).await;
                     }
@@ -2431,19 +2204,20 @@ async fn apply_wire_message(
                     nonce: new_nonce(ctx.local_peer_id),
                 };
 
-                match publish_room_wire_with_fallback(swarm, ctx.topic, &targets, &response, None) {
-                    Ok(outcome) if room_publish_reached_peer(outcome) => {
+                match publish_room_wire_with_outcome(swarm, ctx.topic, &response) {
+                    Ok(RoomPublishOutcome::Published) => {
                         send_status(ui, format!("sent {} history messages", ctx.history.len()))
                             .await;
                     }
-                    Ok(RoomPublishOutcome::NoPeers) => {
+                    Ok(RoomPublishOutcome::NoSubscribers) => {
                         send_status(
                             ui,
-                            format!("history response to {requester} not sent: no reachable peers"),
+                            format!(
+                                "history response to {requester} not sent: no gossipsub subscribers"
+                            ),
                         )
                         .await;
                     }
-                    Ok(RoomPublishOutcome::Published | RoomPublishOutcome::DirectFallback(_)) => {}
                     Err(err) => {
                         send_status(ui, format!("history response failed: {err}")).await;
                     }
@@ -2518,26 +2292,21 @@ async fn apply_wire_message(
                     nonce: new_nonce(ctx.local_peer_id),
                 };
 
-                match publish_room_wire_with_fallback(
-                    swarm,
-                    ctx.topic,
-                    &targets,
-                    &request,
-                    Some(ctx.pending_direct_sync_requests),
-                ) {
-                    Ok(outcome) if room_publish_reached_peer(outcome) => {
+                match publish_room_wire_with_outcome(swarm, ctx.topic, &request) {
+                    Ok(RoomPublishOutcome::Published) => {
                         ctx.queue_request_times
                             .insert(peer_id.clone(), Instant::now());
                         send_status(ui, format!("requesting queue from {peer_id}")).await;
                     }
-                    Ok(RoomPublishOutcome::NoPeers) => {
+                    Ok(RoomPublishOutcome::NoSubscribers) => {
                         send_status(
                             ui,
-                            format!("queue request for {peer_id} not sent: no reachable peers"),
+                            format!(
+                                "queue request for {peer_id} not sent: no gossipsub subscribers"
+                            ),
                         )
                         .await;
                     }
-                    Ok(RoomPublishOutcome::Published | RoomPublishOutcome::DirectFallback(_)) => {}
                     Err(err) => {
                         send_status(ui, format!("queue request failed: {err}")).await;
                     }
@@ -2568,19 +2337,20 @@ async fn apply_wire_message(
                     nonce: new_nonce(ctx.local_peer_id),
                 };
 
-                match publish_room_wire_with_fallback(swarm, ctx.topic, &targets, &response, None) {
-                    Ok(outcome) if room_publish_reached_peer(outcome) => {
+                match publish_room_wire_with_outcome(swarm, ctx.topic, &response) {
+                    Ok(RoomPublishOutcome::Published) => {
                         send_status(ui, format!("sent {} queue item(s)", ctx.music.queue.len()))
                             .await;
                     }
-                    Ok(RoomPublishOutcome::NoPeers) => {
+                    Ok(RoomPublishOutcome::NoSubscribers) => {
                         send_status(
                             ui,
-                            format!("queue response to {requester} not sent: no reachable peers"),
+                            format!(
+                                "queue response to {requester} not sent: no gossipsub subscribers"
+                            ),
                         )
                         .await;
                     }
-                    Ok(RoomPublishOutcome::Published | RoomPublishOutcome::DirectFallback(_)) => {}
                     Err(err) => {
                         send_status(ui, format!("queue response failed: {err}")).await;
                     }
@@ -3005,7 +2775,6 @@ async fn apply_wire_message(
                         known_version,
                         known_updated_at_micros,
                         ctx.queue_request_times,
-                        ctx.pending_direct_sync_requests,
                         swarm,
                         ctx.topic,
                         &targets,
@@ -3074,7 +2843,6 @@ async fn apply_wire_message(
                 ctx.local_peer_id,
                 room_peer_total,
                 ctx.queue_request_times,
-                ctx.pending_direct_sync_requests,
                 ui,
             )
             .await
@@ -3206,7 +2974,6 @@ async fn resolve_active_vote_after_queue_apply(
         ctx.local_peer_id,
         room_peer_total,
         ctx.queue_request_times,
-        ctx.pending_direct_sync_requests,
         ui,
     )
     .await
@@ -3303,13 +3070,9 @@ async fn request_queue_for_vote_context(
     known_version: u64,
     known_updated_at_micros: i64,
     queue_request_times: &mut HashMap<String, Instant>,
-    pending_direct_sync_requests: &mut HashMap<
-        request_response::OutboundRequestId,
-        PendingDirectSyncRequest,
-    >,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
-    targets: &PublishTargets<'_>,
+    _targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
     ui: &mpsc::Sender<UiEvent>,
 ) {
@@ -3327,14 +3090,8 @@ async fn request_queue_for_vote_context(
         nonce: new_nonce(local_peer_id),
     };
 
-    match publish_room_wire_with_fallback(
-        swarm,
-        topic,
-        targets,
-        &request,
-        Some(pending_direct_sync_requests),
-    ) {
-        Ok(outcome) if room_publish_reached_peer(outcome) => {
+    match publish_room_wire_with_outcome(swarm, topic, &request) {
+        Ok(RoomPublishOutcome::Published) => {
             queue_request_times.insert(proposal.proposer.clone(), Instant::now());
             send_status(
                 ui,
@@ -3345,17 +3102,16 @@ async fn request_queue_for_vote_context(
             )
             .await;
         }
-        Ok(RoomPublishOutcome::NoPeers) => {
+        Ok(RoomPublishOutcome::NoSubscribers) => {
             send_status(
                 ui,
                 format!(
-                    "queue request for vote {} not sent: no reachable peers",
+                    "queue request for vote {} not sent: no gossipsub subscribers",
                     proposal.vote_id
                 ),
             )
             .await;
         }
-        Ok(RoomPublishOutcome::Published | RoomPublishOutcome::DirectFallback(_)) => {}
         Err(err) => {
             send_status(ui, format!("queue request for vote context failed: {err}")).await;
         }
@@ -3456,78 +3212,6 @@ fn should_request_queue(queue_request_times: &HashMap<String, Instant>, peer_id:
         .is_none_or(|last_request| last_request.elapsed() >= QUEUE_REQUEST_COOLDOWN)
 }
 
-fn send_direct_message_to_connected_peers(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
-    rendezvous_nodes: &HashSet<PeerId>,
-    topic_name: &str,
-    message: &WireMessage,
-    mut pending_direct_sync_requests: Option<
-        &mut HashMap<request_response::OutboundRequestId, PendingDirectSyncRequest>,
-    >,
-) -> usize {
-    let local_peer_id = *swarm.local_peer_id();
-    let peer_ids = direct_message_targets(local_peer_id, peer_routes, rendezvous_nodes, message);
-
-    let count = peer_ids.len();
-    for peer_id in peer_ids {
-        let request_id = swarm.behaviour_mut().direct_messages.send_request(
-            &peer_id,
-            DirectMessageRequest {
-                topic: topic_name.to_string(),
-                message: message.clone(),
-            },
-        );
-        if let Some(pending) = pending_direct_sync_requests.as_deref_mut() {
-            if let Some(sync_request) = pending_direct_sync_request(message, peer_id) {
-                pending.insert(request_id, sync_request);
-            }
-        }
-    }
-
-    count
-}
-
-fn pending_direct_sync_request(
-    message: &WireMessage,
-    direct_peer_id: PeerId,
-) -> Option<PendingDirectSyncRequest> {
-    match message {
-        WireMessage::HistoryRequest { target, .. }
-            if parse_peer_id(target) == Some(direct_peer_id) =>
-        {
-            Some(PendingDirectSyncRequest::History {
-                peer_id: target.clone(),
-            })
-        }
-        WireMessage::QueueRequest { target, .. }
-            if parse_peer_id(target) == Some(direct_peer_id) =>
-        {
-            Some(PendingDirectSyncRequest::Queue {
-                peer_id: target.clone(),
-            })
-        }
-        _ => None,
-    }
-}
-
-fn clear_direct_sync_cooldown(
-    pending: PendingDirectSyncRequest,
-    history_request_times: &mut HashMap<String, Instant>,
-    queue_request_times: &mut HashMap<String, Instant>,
-) -> (&'static str, String) {
-    match pending {
-        PendingDirectSyncRequest::History { peer_id } => {
-            history_request_times.remove(&peer_id);
-            ("history", peer_id)
-        }
-        PendingDirectSyncRequest::Queue { peer_id } => {
-            queue_request_times.remove(&peer_id);
-            ("queue", peer_id)
-        }
-    }
-}
-
 fn history_summary_is_newer(
     history: &[ChatRecord],
     remote_count: usize,
@@ -3554,112 +3238,34 @@ fn history_newest_at(history: &[ChatRecord]) -> Option<i64> {
         .max()
 }
 
-fn direct_message_targets(
-    local_peer_id: PeerId,
-    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
-    rendezvous_nodes: &HashSet<PeerId>,
-    message: &WireMessage,
-) -> Vec<PeerId> {
-    if let Some(target) = direct_message_target_peer(message) {
-        return parse_peer_id(target)
-            .filter(|peer_id| {
-                direct_message_target_is_eligible(
-                    local_peer_id,
-                    *peer_id,
-                    peer_routes,
-                    rendezvous_nodes,
-                )
-            })
-            .into_iter()
-            .collect();
-    }
-
-    peer_routes
-        .iter()
-        .filter(|(peer_id, _)| {
-            direct_message_target_is_eligible(
-                local_peer_id,
-                **peer_id,
-                peer_routes,
-                rendezvous_nodes,
-            )
-        })
-        .map(|(peer_id, _)| *peer_id)
-        .collect()
-}
-
-fn direct_message_target_peer(message: &WireMessage) -> Option<&str> {
-    match message {
-        WireMessage::HistoryRequest { target, .. }
-        | WireMessage::QueueRequest { target, .. }
-        | WireMessage::QueueResponse { target, .. } => Some(target.as_str()),
-        WireMessage::HistoryResponse {
-            target: Some(target),
-            ..
-        } => Some(target.as_str()),
-        _ => None,
-    }
-}
-
-fn direct_message_target_is_eligible(
-    local_peer_id: PeerId,
-    peer_id: PeerId,
-    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
-    rendezvous_nodes: &HashSet<PeerId>,
-) -> bool {
-    peer_id != local_peer_id
-        && !rendezvous_nodes.contains(&peer_id)
-        && peer_routes
-            .get(&peer_id)
-            .is_some_and(|routes| routes.has_direct() || routes.has_relayed())
-}
-
 fn publish_chat_wire(
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
-    targets: &PublishTargets<'_>,
+    _targets: &PublishTargets<'_>,
     message: &WireMessage,
 ) -> Result<RoomPublishOutcome> {
-    publish_room_wire_with_fallback(swarm, topic, targets, message, None)
+    publish_room_wire_with_outcome(swarm, topic, message)
 }
 
 fn classify_room_publish_error(error: &gossipsub::PublishError) -> RoomPublishPlan {
     match error {
         gossipsub::PublishError::Duplicate => RoomPublishPlan::Published,
-        gossipsub::PublishError::NoPeersSubscribedToTopic => RoomPublishPlan::DirectFallback,
+        gossipsub::PublishError::NoPeersSubscribedToTopic => RoomPublishPlan::NoSubscribers,
         _ => RoomPublishPlan::Failed,
     }
 }
 
-fn publish_room_wire_with_fallback(
+fn publish_room_wire_with_outcome(
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
-    targets: &PublishTargets<'_>,
     message: &WireMessage,
-    pending_direct_sync_requests: Option<
-        &mut HashMap<request_response::OutboundRequestId, PendingDirectSyncRequest>,
-    >,
 ) -> Result<RoomPublishOutcome> {
     let data = serde_json::to_vec(message)?;
     match swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
         Ok(_) => Ok(RoomPublishOutcome::Published),
         Err(err) => match classify_room_publish_error(&err) {
             RoomPublishPlan::Published => Ok(RoomPublishOutcome::Published),
-            RoomPublishPlan::DirectFallback => {
-                let direct_count = send_direct_message_to_connected_peers(
-                    swarm,
-                    targets.peer_routes,
-                    targets.rendezvous_nodes,
-                    targets.topic_name,
-                    message,
-                    pending_direct_sync_requests,
-                );
-                if direct_count == 0 {
-                    Ok(RoomPublishOutcome::NoPeers)
-                } else {
-                    Ok(RoomPublishOutcome::DirectFallback(direct_count))
-                }
-            }
+            RoomPublishPlan::NoSubscribers => Ok(RoomPublishOutcome::NoSubscribers),
             RoomPublishPlan::Failed => Err(anyhow!(err)),
         },
     }
@@ -3668,17 +3274,10 @@ fn publish_room_wire_with_fallback(
 fn publish_room_wire(
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
-    targets: &PublishTargets<'_>,
+    _targets: &PublishTargets<'_>,
     message: &WireMessage,
 ) -> Result<()> {
-    publish_room_wire_with_fallback(swarm, topic, targets, message, None).map(|_| ())
-}
-
-fn room_publish_reached_peer(outcome: RoomPublishOutcome) -> bool {
-    matches!(
-        outcome,
-        RoomPublishOutcome::Published | RoomPublishOutcome::DirectFallback(_)
-    )
+    publish_room_wire_with_outcome(swarm, topic, message).map(|_| ())
 }
 
 fn publish_queue_state(
@@ -4676,10 +4275,6 @@ async fn propose_or_execute_vote(
     local_peer_id: PeerId,
     room_peer_count: usize,
     queue_request_times: &mut HashMap<String, Instant>,
-    pending_direct_sync_requests: &mut HashMap<
-        request_response::OutboundRequestId,
-        PendingDirectSyncRequest,
-    >,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
     if music.active_vote.is_some() {
@@ -4742,7 +4337,6 @@ async fn propose_or_execute_vote(
         local_peer_id,
         room_peer_count,
         queue_request_times,
-        pending_direct_sync_requests,
         ui,
     )
     .await
@@ -4763,10 +4357,6 @@ async fn cast_vote(
     local_peer_id: PeerId,
     room_peer_count: usize,
     queue_request_times: &mut HashMap<String, Instant>,
-    pending_direct_sync_requests: &mut HashMap<
-        request_response::OutboundRequestId,
-        PendingDirectSyncRequest,
-    >,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
     let Some(vote_outcome) = music.cast_vote(local_peer_id.to_string(), approve) else {
@@ -4810,7 +4400,6 @@ async fn cast_vote(
         local_peer_id,
         room_peer_count,
         queue_request_times,
-        pending_direct_sync_requests,
         ui,
     )
     .await
@@ -4830,10 +4419,6 @@ async fn resolve_active_vote(
     local_peer_id: PeerId,
     room_peer_count: usize,
     queue_request_times: &mut HashMap<String, Instant>,
-    pending_direct_sync_requests: &mut HashMap<
-        request_response::OutboundRequestId,
-        PendingDirectSyncRequest,
-    >,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
     let threshold = majority_threshold(room_peer_count);
@@ -4843,7 +4428,6 @@ async fn resolve_active_vote(
             music.queue_version,
             music.queue_updated_at,
             queue_request_times,
-            pending_direct_sync_requests,
             swarm,
             topic,
             targets,
@@ -5655,15 +5239,14 @@ mod tests {
     use std::collections::HashSet;
 
     use libp2p::identity;
-    use libp2p::swarm::ConnectionId;
     use tokio::task::JoinHandle;
 
     use crate::connection_state::{
-        ConnectionState, DIRECT_PROMOTION_FAILURE_DEDUP_WINDOW, DIRECT_PROMOTION_MAX_FAILURES,
+        DIRECT_PROMOTION_FAILURE_DEDUP_WINDOW, DIRECT_PROMOTION_MAX_FAILURES,
         DIRECT_PROMOTION_MEDIUM_RETRY_FAILURES, DIRECT_PROMOTION_MEDIUM_RETRY_INTERVAL,
         DIRECT_PROMOTION_RETRY_INTERVAL, DIRECT_PROMOTION_SLOW_RETRY_FAILURES,
-        DIRECT_PROMOTION_SLOW_RETRY_INTERVAL, DirectPromotionBackoff,
-        DirectPromotionFailureOutcome, normalize_direct_peer_address,
+        DIRECT_PROMOTION_SLOW_RETRY_INTERVAL, DirectPromotionBackoff, DirectPromotionFailureOutcome,
+        normalize_direct_peer_address,
     };
 
     use super::*;
@@ -5758,10 +5341,6 @@ mod tests {
             anchor_time_micros,
             rate: 1.0,
         }
-    }
-
-    fn cid(id: usize) -> ConnectionId {
-        ConnectionId::new_unchecked(id)
     }
 
     struct TestBackend {
@@ -5967,59 +5546,6 @@ mod tests {
         assert_eq!(majority_threshold(peers.len()), 2);
     }
 
-    #[test]
-    fn direct_fallback_targets_skip_local_and_rendezvous_peers() {
-        let local = peer_id();
-        let room_peer = peer_id();
-        let rendezvous = peer_id();
-        let now = Instant::now();
-        let mut connections = ConnectionState::new(local);
-
-        connections.connection_established(room_peer, cid(1), true, false, now);
-        connections.connection_established(rendezvous, cid(2), true, true, now);
-
-        let message = WireMessage::Chat {
-            id: None,
-            peer_id: local.to_string(),
-            joined_at: None,
-            name: "alice".to_string(),
-            text: "hello".to_string(),
-            sent_at: 1_700_000_000_000_000,
-        };
-        let targets = direct_message_targets(
-            local,
-            connections.routes(),
-            &HashSet::from([rendezvous]),
-            &message,
-        );
-
-        assert_eq!(targets, vec![room_peer]);
-    }
-
-    #[test]
-    fn direct_fallback_targets_sync_request_to_target_peer_only() {
-        let local = peer_id();
-        let target = peer_id();
-        let other_room_peer = peer_id();
-        let now = Instant::now();
-        let mut connections = ConnectionState::new(local);
-
-        connections.connection_established(target, cid(1), true, false, now);
-        connections.connection_established(other_room_peer, cid(2), true, false, now);
-
-        let message = WireMessage::QueueRequest {
-            requester: local.to_string(),
-            target: target.to_string(),
-            known_version: 1,
-            known_updated_at_micros: 100,
-            nonce: 1,
-        };
-        let targets =
-            direct_message_targets(local, connections.routes(), &HashSet::new(), &message);
-
-        assert_eq!(targets, vec![target]);
-    }
-
     #[tokio::test]
     async fn peer_names_allow_duplicate_display_aliases() {
         let local = peer_id();
@@ -6181,55 +5707,15 @@ mod tests {
     }
 
     #[test]
-    fn room_publish_error_classification_only_fallbacks_without_subscribers() {
+    fn room_publish_error_classification_reports_no_subscribers() {
         assert_eq!(
             classify_room_publish_error(&gossipsub::PublishError::Duplicate),
             RoomPublishPlan::Published
         );
         assert_eq!(
             classify_room_publish_error(&gossipsub::PublishError::NoPeersSubscribedToTopic),
-            RoomPublishPlan::DirectFallback
+            RoomPublishPlan::NoSubscribers
         );
-    }
-
-    #[test]
-    fn room_publish_reached_peer_excludes_no_peers_outcome() {
-        assert!(room_publish_reached_peer(RoomPublishOutcome::Published));
-        assert!(room_publish_reached_peer(
-            RoomPublishOutcome::DirectFallback(2)
-        ));
-        assert!(!room_publish_reached_peer(RoomPublishOutcome::NoPeers));
-    }
-
-    #[test]
-    fn direct_sync_failure_clears_matching_request_cooldown() {
-        let mut history_request_times = HashMap::new();
-        let mut queue_request_times = HashMap::new();
-        let now = Instant::now();
-
-        history_request_times.insert("history-peer".to_string(), now);
-        queue_request_times.insert("queue-peer".to_string(), now);
-
-        let cleared = clear_direct_sync_cooldown(
-            PendingDirectSyncRequest::History {
-                peer_id: "history-peer".to_string(),
-            },
-            &mut history_request_times,
-            &mut queue_request_times,
-        );
-        assert_eq!(cleared, ("history", "history-peer".to_string()));
-        assert!(!history_request_times.contains_key("history-peer"));
-        assert!(queue_request_times.contains_key("queue-peer"));
-
-        let cleared = clear_direct_sync_cooldown(
-            PendingDirectSyncRequest::Queue {
-                peer_id: "queue-peer".to_string(),
-            },
-            &mut history_request_times,
-            &mut queue_request_times,
-        );
-        assert_eq!(cleared, ("queue", "queue-peer".to_string()));
-        assert!(!queue_request_times.contains_key("queue-peer"));
     }
 
     #[test]
@@ -6263,26 +5749,6 @@ mod tests {
             0,
             Some(1_700_000_000_000_000)
         ));
-    }
-
-    #[test]
-    fn pending_direct_sync_request_tracks_only_matching_targets() {
-        let target = peer_id();
-        let other = peer_id();
-        let message = WireMessage::HistoryRequest {
-            requester: other.to_string(),
-            target: target.to_string(),
-            known_count: 0,
-            nonce: 1,
-        };
-
-        assert_eq!(
-            pending_direct_sync_request(&message, target),
-            Some(PendingDirectSyncRequest::History {
-                peer_id: target.to_string()
-            })
-        );
-        assert_eq!(pending_direct_sync_request(&message, other), None);
     }
 
     #[test]

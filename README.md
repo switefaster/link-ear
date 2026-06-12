@@ -1,32 +1,31 @@
 # link-ear
 
-`link-ear` is a Rust/libp2p peer-to-peer chat and shared listening app. Peers can chat, co-manage a music queue, and keep playback state roughly synchronized through the Tauri desktop shell. The terminal UI still exists as a legacy/debug path and is kept compiling while the desktop flow stabilizes.
+`link-ear` is a Rust/libp2p peer-to-peer chat and shared listening app. Peers can chat, co-manage a music queue, and keep playback state roughly synchronized through the Tauri desktop shell.
 
 ## Run
 
-Start two clients on the same LAN:
+The primary client is the Tauri desktop app. Install frontend dependencies and build the web assets from the repository root:
 
 ```powershell
-cargo run -- --name alice
-cargo run -- --name bob
+npm.cmd install
+npm.cmd run build
 ```
 
-Peers on the same network are discovered with mDNS. For remote peers, pass a full multiaddr:
+Run the desktop app in development with the Tauri CLI:
 
 ```powershell
-cargo run -- --peer /ip4/203.0.113.10/tcp/4001/p2p/12D3KooW...
+npx --yes @tauri-apps/cli@^2 dev
 ```
-IPv6 multiaddrs are also supported, for example `/ip6/2001:db8::1/tcp/4001/p2p/...`.
 
-Default bind includes both IPv6 and IPv4, and outbound dials try IPv6 addresses first when multiple are present.
+The setup screen accepts display name, topic, listen multiaddrs, explicit peer multiaddrs, relay multiaddrs, and the mDNS toggle. Peers on the same LAN can use mDNS. Remote peers usually meet through a relay/rendezvous node.
 
-To use a circuit relay server, pass its multiaddr. The app dials the relay and requests a relayed listener through `/p2p-circuit`:
+Build the desktop bundle:
 
 ```powershell
-cargo run -- --relay /ip4/203.0.113.20/tcp/4001/p2p/12D3KooW...
+npx --yes @tauri-apps/cli@^2 build
 ```
 
-The same relay address is also used as a rendezvous server. Each client registers under the current `--topic`, periodically discovers other peers in that topic, dials their relayed addresses, and then tries to upgrade relay-only peers to direct P2P connections when possible.
+The relay address is also used as a rendezvous server. Each client registers under the current topic, periodically discovers other peers in that topic, dials their relayed addresses, and then tries to upgrade relay-only peers to direct P2P connections when possible.
 
 Run a minimal public relay plus rendezvous node on a reachable host:
 
@@ -50,9 +49,8 @@ Pass `--no-web` to disable the page. The dashboard shows the relay-observed cont
 
 Open TCP and UDP on the chosen port. The relay prints its peer id at startup; clients use a full relay multiaddr:
 
-```powershell
-cargo run -- --name alice --relay /ip4/203.0.113.20/tcp/4001/p2p/12D3KooW...
-cargo run -- --name bob --relay /ip4/203.0.113.20/tcp/4001/p2p/12D3KooW...
+```text
+/ip4/203.0.113.20/tcp/4001/p2p/12D3KooW...
 ```
 
 If the relay host needs to advertise a specific public address, pass it explicitly:
@@ -61,22 +59,20 @@ If the relay host needs to advertise a specific public address, pass it explicit
 cargo run --bin link-ear-relay -- --external-addr /ip4/203.0.113.20/tcp/4001
 ```
 
-Useful flags:
+Client setup fields:
 
 ```text
---name <NAME>             Display name in chat
---topic <TOPIC>           GossipSub topic, default link-ear.chat.v1
---listen <MULTIADDR>      Add a listen address, can be repeated
---peer <MULTIADDR>        Dial a peer address, can be repeated
---relay <MULTIADDR>       Dial and reserve through a relay, can be repeated
---no-mdns                 Disable LAN discovery
+Name                       Display name in chat
+Topic                      Gossipsub topic, default link-ear.chat.v1
+Listen                     Add listen multiaddrs
+Peers                      Dial explicit peer multiaddrs
+Relay                      Dial and reserve through relay multiaddrs
+Disable mDNS               Disable LAN discovery
 ```
-
-Inside the legacy TUI, type a message and press Enter. Press Esc or Ctrl+C to quit.
 
 ## Desktop frontend
 
-The Tauri desktop UI is a React/Vite app under `desktop/`. Install and run the frontend preview from the repository root:
+The Tauri desktop UI is a React/Vite app under `desktop/`. Run the frontend preview from the repository root when iterating on UI only:
 
 ```powershell
 npm.cmd install
@@ -92,16 +88,11 @@ npm.cmd run build
 Music commands:
 
 ```text
-/bv <BV_ID> [PART]            Append Bilibili audio to the queue
-/insert <INDEX> <BV_ID> [PART] Compatibility alias; backend still appends
-/queue or /q                  Show the current track and the next queue items
-/skip                         Skip the current track
-/remove <INDEX>               Remove a queued track
-/move <FROM> <TO>             Move a queued track, guarded by a vote
-/pause                        Pause playback
-/resume                       Resume playback
-/seek <SECONDS>               Seek playback
-/vote yes|no, /yes, /no       Respond to the active vote
+Append Bilibili BV + part       Add audio to the queue
+Move queue item                 Opens a move vote
+Remove queue item               Direct for own item, otherwise opens a vote
+Play/Pause/Skip/Seek            Uses the current room voting rules
+Vote Yes/No                     Respond to the active vote
 ```
 
 `PART` is 1-based and defaults to `1`.
