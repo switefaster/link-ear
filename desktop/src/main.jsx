@@ -6,6 +6,7 @@ import {
   ArrowUp,
   ChevronDown,
   Check,
+  Download,
   GripVertical,
   ListMusic,
   Pause,
@@ -1125,6 +1126,15 @@ function StatusLogModal({ statuses, logs, onClose }) {
             <option value="vote">Vote</option>
             <option value="system">System</option>
           </select>
+          <button
+            className="btn subtle log-export-button"
+            type="button"
+            onClick={() => exportStatusLogs(entries)}
+            disabled={entries.length === 0}
+          >
+            <Download size={16} aria-hidden="true" />
+            Export
+          </button>
         </div>
 
         <div className="log-summary" aria-label="Log summary">
@@ -1544,6 +1554,42 @@ function createLogEntry(status, index) {
     level,
     category,
   };
+}
+
+function exportStatusLogs(entries) {
+  if (!entries.length) return;
+
+  const body = entries
+    .map((entry) => JSON.stringify({
+      at: new Date(entry.at).toISOString(),
+      at_ms: entry.at,
+      level: entry.level,
+      category: entry.category,
+      text: entry.text,
+    }))
+    .join("\n");
+  const blob = new Blob([`${body}\n`], { type: "application/x-ndjson;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `link-ear-log-${formatFileTimestamp(new Date())}.jsonl`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function formatFileTimestamp(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    "-",
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join("");
 }
 
 function classifyLogLine(text) {
