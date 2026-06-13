@@ -399,6 +399,8 @@ mod tests {
                 duration_ms: 120_000,
                 audio_url: "https://example.test/audio.m4a".to_string(),
                 referer: "https://www.bilibili.com/video/BV1234567890".to_string(),
+                media_init_range: None,
+                media_index_range: None,
             }),
             playing,
             ..state(session_id)

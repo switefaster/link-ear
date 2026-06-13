@@ -40,6 +40,16 @@ pub struct PlaybackTrack {
     pub duration_ms: u64,
     pub audio_url: String,
     pub referer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_init_range: Option<PlaybackByteRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_index_range: Option<PlaybackByteRange>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaybackByteRange {
+    pub start: u64,
+    pub end_inclusive: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

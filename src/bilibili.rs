@@ -11,7 +11,7 @@ use reqwest::{
 };
 use serde::{Deserialize, de::DeserializeOwned};
 
-use crate::core::PlaybackTrack;
+use crate::core::{PlaybackByteRange, PlaybackTrack};
 
 const MIXIN_KEY_ENC_TAB: [usize; 64] = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29,
@@ -77,6 +77,10 @@ struct BilibiliAudio {
     base_url_camel: Option<String>,
     #[serde(rename = "base_url")]
     base_url_snake: Option<String>,
+    #[serde(rename = "SegmentBase")]
+    segment_base_camel: Option<BilibiliSegmentBase>,
+    #[serde(rename = "segment_base")]
+    segment_base_snake: Option<BilibiliSegmentBase>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,9 +89,23 @@ struct BilibiliDurl {
     backup_url: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct BilibiliSegmentBase {
+    #[serde(rename = "Initialization")]
+    initialization_camel: Option<String>,
+    #[serde(rename = "initialization")]
+    initialization_snake: Option<String>,
+    #[serde(rename = "indexRange")]
+    index_range_camel: Option<String>,
+    #[serde(rename = "index_range")]
+    index_range_snake: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MediaCandidate {
     url: String,
+    init_range: Option<PlaybackByteRange>,
+    index_range: Option<PlaybackByteRange>,
 }
 
 impl BilibiliAudio {
@@ -95,6 +113,12 @@ impl BilibiliAudio {
         self.base_url_camel
             .as_deref()
             .or(self.base_url_snake.as_deref())
+    }
+
+    fn segment_base(&self) -> Option<&BilibiliSegmentBase> {
+        self.segment_base_camel
+            .as_ref()
+            .or(self.segment_base_snake.as_ref())
     }
 
     fn quality_key(&self) -> Option<(u8, u64, u64)> {
@@ -113,6 +137,32 @@ impl BilibiliAudio {
         }
         best
     }
+}
+
+impl BilibiliSegmentBase {
+    fn initialization_range(&self) -> Option<PlaybackByteRange> {
+        self.initialization_camel
+            .as_deref()
+            .or(self.initialization_snake.as_deref())
+            .and_then(parse_playback_byte_range)
+    }
+
+    fn index_range(&self) -> Option<PlaybackByteRange> {
+        self.index_range_camel
+            .as_deref()
+            .or(self.index_range_snake.as_deref())
+            .and_then(parse_playback_byte_range)
+    }
+}
+
+fn parse_playback_byte_range(value: &str) -> Option<PlaybackByteRange> {
+    let (start, end) = value.trim().split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end_inclusive = end.parse::<u64>().ok()?;
+    (start <= end_inclusive).then_some(PlaybackByteRange {
+        start,
+        end_inclusive,
+    })
 }
 
 #[cfg(not(feature = "fdk-aac-decoder"))]
@@ -253,15 +303,15 @@ pub async fn resolve_track(
         .ok_or_else(|| anyhow!("part {} does not exist", part_index + 1))?;
 
     let player = resolve_player_info(client, bvid, page.cid, &referer).await?;
-    let media_url = match select_media_url(player) {
-        Ok(url) => url,
+    let media = match select_media(player) {
+        Ok(media) => media,
         Err(err) => {
             let legacy = resolve_player_info_legacy(client, bvid, page.cid, &referer)
                 .await
                 .with_context(|| {
                     format!("play url had no supported media and legacy fallback failed: {err:#}")
                 })?;
-            select_media_url(legacy).with_context(|| {
+            select_media(legacy).with_context(|| {
                 format!("legacy play url had no supported media after WBI media failure: {err:#}")
             })?
         }
@@ -274,8 +324,10 @@ pub async fn resolve_track(
         bvid: bvid.to_string(),
         part: part_index + 1,
         duration_ms: page.duration.saturating_mul(1000),
-        audio_url: media_url,
+        audio_url: media.url,
         referer,
+        media_init_range: media.init_range,
+        media_index_range: media.index_range,
     })
 }
 
@@ -359,17 +411,16 @@ async fn resolve_player_info_legacy(
         .await
 }
 
-fn select_media_url(player: BilibiliPlayerInfo) -> Result<String> {
+fn select_media(player: BilibiliPlayerInfo) -> Result<MediaCandidate> {
     media_candidates(player)?
         .into_iter()
         .next()
-        .map(|candidate| candidate.url)
         .ok_or_else(|| anyhow!("bilibili media stream with supported audio does not exist"))
 }
 
 #[cfg(test)]
 fn best_media_url(player: BilibiliPlayerInfo) -> Result<String> {
-    select_media_url(player)
+    select_media(player).map(|candidate| candidate.url)
 }
 
 fn media_candidates(player: BilibiliPlayerInfo) -> Result<Vec<MediaCandidate>> {
@@ -382,6 +433,12 @@ fn media_candidates(player: BilibiliPlayerInfo) -> Result<Vec<MediaCandidate>> {
                     audio.quality_key()?,
                     MediaCandidate {
                         url: base_url.to_string(),
+                        init_range: audio
+                            .segment_base()
+                            .and_then(BilibiliSegmentBase::initialization_range),
+                        index_range: audio
+                            .segment_base()
+                            .and_then(BilibiliSegmentBase::index_range),
                     },
                 ))
             })
@@ -403,7 +460,11 @@ fn media_candidates(player: BilibiliPlayerInfo) -> Result<Vec<MediaCandidate>> {
             .into_iter()
             .flat_map(BilibiliDurl::candidate_urls)
             .filter(|url| !url.is_empty())
-            .map(|url| MediaCandidate { url })
+            .map(|url| MediaCandidate {
+                url,
+                init_range: None,
+                index_range: None,
+            })
             .collect::<Vec<_>>();
         if !candidates.is_empty() {
             return Ok(std::mem::take(&mut candidates));
@@ -760,6 +821,20 @@ mod tests {
     }
 
     #[test]
+    fn playback_byte_range_parser_accepts_bilibili_segment_base_ranges() {
+        assert_eq!(
+            parse_playback_byte_range("0-817"),
+            Some(PlaybackByteRange {
+                start: 0,
+                end_inclusive: 817
+            })
+        );
+        assert_eq!(parse_playback_byte_range("818-24417").unwrap().start, 818);
+        assert_eq!(parse_playback_byte_range("24417-818"), None);
+        assert_eq!(parse_playback_byte_range("not-a-range"), None);
+    }
+
+    #[test]
     fn http_412_errors_are_detected_for_fallback() {
         let error: anyhow::Error = BilibiliHttpStatusError {
             endpoint: "play url",
@@ -782,6 +857,8 @@ mod tests {
                         codecs: Some("mp4a.40.2".to_string()),
                         base_url_camel: Some("https://example.test/low.m4s".to_string()),
                         base_url_snake: None,
+                        segment_base_camel: None,
+                        segment_base_snake: None,
                     },
                     BilibiliAudio {
                         id: 30280,
@@ -789,6 +866,8 @@ mod tests {
                         codecs: Some("mp4a.40.2".to_string()),
                         base_url_camel: None,
                         base_url_snake: Some("https://example.test/high.m4s".to_string()),
+                        segment_base_camel: None,
+                        segment_base_snake: None,
                     },
                 ]),
             }),
@@ -805,6 +884,46 @@ mod tests {
     }
 
     #[test]
+    fn best_media_preserves_dash_segment_base_ranges() {
+        let player = BilibiliPlayerInfo {
+            dash: Some(BilibiliDash {
+                audio: Some(vec![BilibiliAudio {
+                    id: 30280,
+                    bandwidth: Some(128),
+                    codecs: Some("mp4a.40.2".to_string()),
+                    base_url_camel: Some("https://example.test/audio.m4s".to_string()),
+                    base_url_snake: None,
+                    segment_base_camel: Some(BilibiliSegmentBase {
+                        initialization_camel: Some("0-817".to_string()),
+                        initialization_snake: None,
+                        index_range_camel: Some("818-24417".to_string()),
+                        index_range_snake: None,
+                    }),
+                    segment_base_snake: None,
+                }]),
+            }),
+            durl: None,
+        };
+
+        let media = select_media(player).unwrap();
+        assert_eq!(media.url, "https://example.test/audio.m4s");
+        assert_eq!(
+            media.init_range,
+            Some(PlaybackByteRange {
+                start: 0,
+                end_inclusive: 817
+            })
+        );
+        assert_eq!(
+            media.index_range,
+            Some(PlaybackByteRange {
+                start: 818,
+                end_inclusive: 24417
+            })
+        );
+    }
+
+    #[test]
     fn best_media_url_prefers_decoder_supported_aac_lc() {
         let player = BilibiliPlayerInfo {
             dash: Some(BilibiliDash {
@@ -815,6 +934,8 @@ mod tests {
                         codecs: Some("mp4a.40.5".to_string()),
                         base_url_camel: Some("https://example.test/he-aac.m4s".to_string()),
                         base_url_snake: None,
+                        segment_base_camel: None,
+                        segment_base_snake: None,
                     },
                     BilibiliAudio {
                         id: 30232,
@@ -822,6 +943,8 @@ mod tests {
                         codecs: Some("mp4a.40.2".to_string()),
                         base_url_camel: Some("https://example.test/aac-lc.m4s".to_string()),
                         base_url_snake: None,
+                        segment_base_camel: None,
+                        segment_base_snake: None,
                     },
                 ]),
             }),
@@ -860,6 +983,8 @@ mod tests {
                     codecs: Some("fLaC".to_string()),
                     base_url_camel: Some("https://example.test/flac.m4s".to_string()),
                     base_url_snake: None,
+                    segment_base_camel: None,
+                    segment_base_snake: None,
                 }]),
             }),
             durl: Some(vec![BilibiliDurl {
@@ -885,6 +1010,8 @@ mod tests {
                     codecs: Some("mp4a.40.5".to_string()),
                     base_url_camel: Some("https://example.test/he-aac.m4s".to_string()),
                     base_url_snake: None,
+                    segment_base_camel: None,
+                    segment_base_snake: None,
                 }]),
             }),
             durl: Some(vec![BilibiliDurl {
@@ -909,6 +1036,8 @@ mod tests {
                     codecs: None,
                     base_url_camel: Some("https://example.test/unknown-aac.m4s".to_string()),
                     base_url_snake: None,
+                    segment_base_camel: None,
+                    segment_base_snake: None,
                 }]),
             }),
             durl: Some(vec![BilibiliDurl {
