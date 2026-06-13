@@ -1558,6 +1558,13 @@ async function resolveBilibiliBvidFromClipboard() {
 }
 
 async function readClipboardText() {
+  try {
+    const text = await invoke("read_clipboard_text");
+    if (typeof text === "string" && text) return text;
+  } catch {
+    // Fall back to the WebView clipboard API below.
+  }
+
   if (!navigator.clipboard?.readText) return "";
 
   try {

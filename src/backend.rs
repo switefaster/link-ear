@@ -68,6 +68,7 @@ const BUFFER_HEALTH_LOSS_GRACE: Duration = Duration::from_secs(3);
 const BUFFER_HEALTH_STALE_AFTER: Duration = Duration::from_secs(5);
 const BUFFER_HEALTH_PUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const BUFFER_HEALTH_PUBLISH_MIN_ADVANCE_MS: u64 = media_cache::LOW_WATERMARK_MS;
+const AUDIO_OUTPUT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const VOTE_TIMEOUT: Duration = Duration::from_secs(20);
 const RENDEZVOUS_DISCOVER_INTERVAL: Duration = Duration::from_secs(30);
 const RENDEZVOUS_REGISTER_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -223,10 +224,11 @@ pub async fn run_network(
     let mut audio_player = match player::AudioPlayer::new() {
         Ok(player) => Some(player),
         Err(err) => {
-            send_status(&ui, format!("audio output unavailable: {err}")).await;
+            send_status(&ui, format!("audio output unavailable: {err:#}")).await;
             None
         }
     };
+    let mut next_audio_output_retry = Instant::now() + AUDIO_OUTPUT_RETRY_INTERVAL;
     let mut history_sync = time::interval(HISTORY_SYNC_INTERVAL);
     history_sync.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut history_sync_burst = time::interval(HISTORY_SYNC_BURST_TICK);
@@ -718,6 +720,36 @@ pub async fn run_network(
                 }
             },
             _ = music_local.tick() => {
+                if audio_player.is_none()
+                    && (music.has_track() || buffer_coordinator.is_active())
+                    && Instant::now() >= next_audio_output_retry
+                {
+                    next_audio_output_retry = Instant::now() + AUDIO_OUTPUT_RETRY_INTERVAL;
+                    if try_restore_audio_output(&mut audio_player, &ui, "scheduled retry").await {
+                        if let Some(state) = music.playback_state().cloned().filter(|state| state.track.is_some()) {
+                            if let Err(err) = apply_remote_playback_state(
+                                &http_client,
+                                &mut audio_player,
+                                &mut music,
+                                &state,
+                                &ui,
+                            ).await {
+                                if handle_local_audio_output_error(
+                                    &mut audio_player,
+                                    &ui,
+                                    "playback sync after audio output recovery",
+                                    &err,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                                send_status(&ui, format!("playback sync failed after audio output recovery: {err:#}")).await;
+                            }
+                        }
+                    }
+                }
+
                 let targets = PublishTargets {
                     rendezvous_nodes: &rendezvous_nodes,
                 };
@@ -844,6 +876,16 @@ pub async fn run_network(
                 if let Some(state) = music.playback_state().cloned() {
                     let now = current_timestamp_micros();
                     if let Err(err) = sync_loaded_player_to_state(&mut audio_player, &state, now) {
+                        if handle_local_audio_output_error(
+                            &mut audio_player,
+                            &ui,
+                            "playback sync",
+                            &err,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         failed_audio_sessions.insert(state.session_id.clone());
                         if state.leader_peer_id == local_peer_id.to_string() {
                             send_status(&ui, format!("local playback failed: {err:#}")).await;
@@ -2495,6 +2537,16 @@ async fn apply_wire_message(
             if state.leader_peer_id != ctx.local_peer_id.to_string()
                 && should_apply_playback_state(ctx.music.playback_state(), &state)
             {
+                abandon_local_buffer_operation(
+                    ctx.buffer_coordinator,
+                    swarm,
+                    ctx.topic,
+                    &targets,
+                    ctx.local_peer_id,
+                    "superseded by remote playback",
+                    ui,
+                )
+                .await;
                 cancel_local_pending_playback(
                     ctx.music,
                     swarm,
@@ -2522,6 +2574,16 @@ async fn apply_wire_message(
                         }
                     }
                     Err(err) => {
+                        if handle_local_audio_output_error(
+                            &mut *ctx.audio_player,
+                            ui,
+                            "playback sync",
+                            &err,
+                        )
+                        .await
+                        {
+                            return true;
+                        }
                         send_status(ui, format!("playback sync failed: {err:#}")).await;
                         mark_local_audio_session_failed(
                             &mut *ctx.audio_player,
@@ -2553,6 +2615,16 @@ async fn apply_wire_message(
                 && is_expected
                 && should_apply_playback_state(ctx.music.playback_state(), &state)
             {
+                abandon_local_buffer_operation(
+                    ctx.buffer_coordinator,
+                    swarm,
+                    ctx.topic,
+                    &targets,
+                    ctx.local_peer_id,
+                    "superseded by remote playback prepare",
+                    ui,
+                )
+                .await;
                 cancel_local_pending_playback(
                     ctx.music,
                     swarm,
@@ -2655,6 +2727,23 @@ async fn apply_wire_message(
                 return true;
             }
 
+            if ctx.failed_audio_sessions.contains(&session_id) {
+                publish_playback_buffer_status(
+                    swarm,
+                    ctx.topic,
+                    &targets,
+                    &operation_id,
+                    &session_id,
+                    ctx.local_peer_id,
+                    PlaybackBufferStatusKind::Failed,
+                    None,
+                    Some("local audio already failed for this session".to_string()),
+                )
+                .ok();
+                let _ = ui.send(UiEvent::PlaybackBuffer(None)).await;
+                return true;
+            }
+
             if let Some(local_status) = ctx.buffer_coordinator.status_for(
                 &operation_id,
                 &session_id,
@@ -2690,6 +2779,16 @@ async fn apply_wire_message(
                 .ok();
                 return true;
             };
+            abandon_local_buffer_operation(
+                ctx.buffer_coordinator,
+                swarm,
+                ctx.topic,
+                &targets,
+                ctx.local_peer_id,
+                "superseded by remote buffer prepare",
+                ui,
+            )
+            .await;
             let state = PlaybackState {
                 session_id: session_id.clone(),
                 leader_peer_id: leader_peer_id.clone(),
@@ -2732,6 +2831,8 @@ async fn apply_wire_message(
                 Instant::now(),
             );
             send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
+            let audio_available =
+                ensure_audio_output(&mut *ctx.audio_player, ui, "buffer prepare").await;
             if let Some(player) = ctx.audio_player.as_mut() {
                 if let Err(err) = player.prepare_stream(
                     ctx.http_client,
@@ -2790,6 +2891,14 @@ async fn apply_wire_message(
                     None,
                 )
                 .ok();
+                if !audio_available {
+                    send_status(
+                        ui,
+                        "audio output unavailable locally; reporting buffer ready so the room can continue"
+                            .to_string(),
+                    )
+                    .await;
+                }
                 send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
             }
             true
@@ -3526,6 +3635,74 @@ fn build_queue_state(local_peer_id: PeerId, music: &MusicState) -> QueueState {
     music.queue_state(local_peer_id)
 }
 
+async fn ensure_audio_output(
+    audio_player: &mut Option<player::AudioPlayer>,
+    ui: &mpsc::Sender<UiEvent>,
+    context: &str,
+) -> bool {
+    if audio_player.is_some() {
+        return true;
+    }
+
+    try_restore_audio_output(audio_player, ui, context).await
+}
+
+async fn try_restore_audio_output(
+    audio_player: &mut Option<player::AudioPlayer>,
+    ui: &mpsc::Sender<UiEvent>,
+    context: &str,
+) -> bool {
+    match player::AudioPlayer::new() {
+        Ok(player) => {
+            *audio_player = Some(player);
+            send_status(ui, format!("audio output recovered during {context}")).await;
+            true
+        }
+        Err(err) => {
+            send_status(
+                ui,
+                format!("audio output unavailable during {context}: {err:#}"),
+            )
+            .await;
+            false
+        }
+    }
+}
+
+async fn handle_local_audio_output_error(
+    audio_player: &mut Option<player::AudioPlayer>,
+    ui: &mpsc::Sender<UiEvent>,
+    context: &str,
+    error: &anyhow::Error,
+) -> bool {
+    if !is_audio_output_error(error) {
+        return false;
+    }
+
+    *audio_player = None;
+    send_status(
+        ui,
+        format!("audio output unavailable during {context}: {error:#}; will retry locally"),
+    )
+    .await;
+    true
+}
+
+fn is_audio_output_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "audio output",
+        "output device",
+        "default output",
+        "audio sink",
+        "sink after reopening",
+        "failed to configure default",
+        "failed to open default",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 async fn handle_audio_player_events(
     events: Vec<player::AudioPlayerEvent>,
     music: &mut MusicState,
@@ -3548,27 +3725,23 @@ async fn handle_audio_player_events(
                 track_id,
                 buffered_until_ms,
             } => {
-                let _ = publish_local_buffer_health(
-                    playback_health,
-                    swarm,
-                    topic,
-                    targets,
-                    local_peer_id,
-                    &session_id,
-                    PlaybackBufferStatusKind::Ready,
-                    Some(buffered_until_ms),
-                );
                 if let Some(operation_id) = operation_id {
-                    let matches_operation = buffer.active().is_some_and(|operation| {
-                        operation.operation_id == operation_id
-                            && operation.state.session_id == session_id
-                            && operation
-                                .state
-                                .track
-                                .as_ref()
-                                .is_some_and(|track| track.track_id == track_id)
-                    });
-                    if matches_operation {
+                    if active_buffer_operation_matches(
+                        buffer,
+                        &operation_id,
+                        &session_id,
+                        &track_id,
+                    ) {
+                        let _ = publish_local_buffer_health(
+                            playback_health,
+                            swarm,
+                            topic,
+                            targets,
+                            local_peer_id,
+                            &session_id,
+                            PlaybackBufferStatusKind::Ready,
+                            Some(buffered_until_ms),
+                        );
                         let _ = buffer.mark_status(
                             &operation_id,
                             &session_id,
@@ -3609,18 +3782,49 @@ async fn handle_audio_player_events(
                         send_buffer_view(ui, buffer, local_peer_id).await;
                     }
                 } else if music.has_pending_playback() {
-                    let _ = music.mark_playback_ready(
+                    if !music_stream_event_matches(music, &session_id, &track_id) {
+                        continue;
+                    }
+                    let outcome = music.mark_playback_ready(
                         &session_id,
                         &local_peer_id.to_string(),
                         local_peer_id,
                     );
-                    maybe_start_pending_playback(music, swarm, topic, targets, local_peer_id, ui)
+                    if matches!(outcome, PlaybackReadyOutcome::Marked { .. }) {
+                        let _ = publish_local_buffer_health(
+                            playback_health,
+                            swarm,
+                            topic,
+                            targets,
+                            local_peer_id,
+                            &session_id,
+                            PlaybackBufferStatusKind::Ready,
+                            Some(buffered_until_ms),
+                        );
+                        maybe_start_pending_playback(
+                            music,
+                            swarm,
+                            topic,
+                            targets,
+                            local_peer_id,
+                            ui,
+                        )
                         .await?;
-                    publish_playback_ready(swarm, topic, targets, &session_id, local_peer_id)?;
-                } else if music
-                    .playback_state()
-                    .is_some_and(|state| state.session_id == session_id)
-                {
+                        publish_playback_ready(swarm, topic, targets, &session_id, local_peer_id)?;
+                    }
+                } else if music.playback_state().is_some_and(|state| {
+                    playback_state_matches_track(state, &session_id, &track_id)
+                }) {
+                    let _ = publish_local_buffer_health(
+                        playback_health,
+                        swarm,
+                        topic,
+                        targets,
+                        local_peer_id,
+                        &session_id,
+                        PlaybackBufferStatusKind::Ready,
+                        Some(buffered_until_ms),
+                    );
                     if let Some(state) = music.playback_state().cloned() {
                         sync_loaded_player_to_state(
                             audio_player,
@@ -3631,6 +3835,9 @@ async fn handle_audio_player_events(
                 }
             }
             player::AudioPlayerEvent::Cache(view) => {
+                if !stream_event_matches_current(buffer, music, &view.session_id, &view.track_id) {
+                    continue;
+                }
                 let status = match view.status {
                     PlaybackCacheStatus::Ready => PlaybackBufferStatusKind::Ready,
                     PlaybackCacheStatus::Preparing | PlaybackCacheStatus::Buffering => {
@@ -3655,6 +3862,9 @@ async fn handle_audio_player_events(
                 track_id,
                 buffered_until_ms,
             } => {
+                if !stream_event_matches_current(buffer, music, &session_id, &track_id) {
+                    continue;
+                }
                 let duration_ms = track_duration_for_session(music, &session_id, &track_id)
                     .unwrap_or(buffered_until_ms);
                 let view = PlaybackCacheView {
@@ -3684,6 +3894,20 @@ async fn handle_audio_player_events(
                 title,
                 error,
             } => {
+                let matches_current = operation_id.as_deref().map_or_else(
+                    || music_stream_event_matches(music, &session_id, &track_id),
+                    |operation_id| {
+                        active_buffer_operation_matches(
+                            buffer,
+                            operation_id,
+                            &session_id,
+                            &track_id,
+                        )
+                    },
+                );
+                if !matches_current {
+                    continue;
+                }
                 let _ = publish_local_buffer_health(
                     playback_health,
                     swarm,
@@ -3732,7 +3956,7 @@ async fn handle_audio_player_events(
                     }
                 } else if let Some(state) = music
                     .playback_state()
-                    .filter(|state| state.session_id == session_id)
+                    .filter(|state| playback_state_matches_track(state, &session_id, &track_id))
                     .cloned()
                 {
                     if state.leader_peer_id == local_peer_id.to_string() {
@@ -3776,6 +4000,19 @@ async fn handle_audio_player_events(
                 }
             }
             player::AudioPlayerEvent::OutputDeviceError { error } => {
+                if audio_player
+                    .as_ref()
+                    .and_then(|player| player.current_track_id())
+                    .is_none()
+                {
+                    *audio_player = None;
+                    send_status(
+                        ui,
+                        format!("audio output error while idle: {error}; will reopen on playback"),
+                    )
+                    .await;
+                    continue;
+                }
                 send_status(
                     ui,
                     format!("audio output error: {error}; reopening default output"),
@@ -3804,6 +4041,23 @@ async fn handle_audio_player_events(
                 }
             }
             player::AudioPlayerEvent::OutputDeviceChanged { previous, current } => {
+                if audio_player
+                    .as_ref()
+                    .and_then(|player| player.current_track_id())
+                    .is_none()
+                {
+                    *audio_player = None;
+                    send_status(
+                        ui,
+                        format!(
+                            "audio output device changed from {} to {} while idle; will reopen on playback",
+                            previous.as_deref().unwrap_or("none"),
+                            current.as_deref().unwrap_or("none")
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
                 send_status(
                     ui,
                     format!(
@@ -3839,10 +4093,9 @@ async fn handle_audio_player_events(
                 session_id,
                 track_id,
             } => {
-                if music
-                    .playback_state()
-                    .is_some_and(|state| state.session_id == session_id)
-                {
+                if music.playback_state().is_some_and(|state| {
+                    playback_state_matches_track(state, &session_id, &track_id)
+                }) {
                     send_status(ui, format!("local stream ended for {track_id}")).await;
                 }
             }
@@ -3850,6 +4103,53 @@ async fn handle_audio_player_events(
     }
 
     Ok(())
+}
+
+fn stream_event_matches_current(
+    buffer: &BufferCoordinator,
+    music: &MusicState,
+    session_id: &str,
+    track_id: &str,
+) -> bool {
+    buffer.active().is_some_and(|operation| {
+        operation.state.session_id == session_id
+            && operation
+                .state
+                .track
+                .as_ref()
+                .is_some_and(|track| track.track_id == track_id)
+    }) || music_stream_event_matches(music, session_id, track_id)
+}
+
+fn active_buffer_operation_matches(
+    buffer: &BufferCoordinator,
+    operation_id: &str,
+    session_id: &str,
+    track_id: &str,
+) -> bool {
+    buffer.active().is_some_and(|operation| {
+        operation.operation_id == operation_id
+            && operation.state.session_id == session_id
+            && operation
+                .state
+                .track
+                .as_ref()
+                .is_some_and(|track| track.track_id == track_id)
+    })
+}
+
+fn music_stream_event_matches(music: &MusicState, session_id: &str, track_id: &str) -> bool {
+    music
+        .playback_state()
+        .is_some_and(|state| playback_state_matches_track(state, session_id, track_id))
+}
+
+fn playback_state_matches_track(state: &PlaybackState, session_id: &str, track_id: &str) -> bool {
+    state.session_id == session_id
+        && state
+            .track
+            .as_ref()
+            .is_some_and(|track| track.track_id == track_id)
 }
 
 async fn maybe_pause_for_buffer_health_loss(
@@ -4063,6 +4363,8 @@ async fn handle_buffer_prepare_failure(
             ui,
         )
         .await;
+        let _ = buffer.clear();
+        let _ = ui.send(UiEvent::PlaybackBuffer(None)).await;
     }
     send_buffer_view(ui, buffer, local_peer_id).await;
     Ok(())
@@ -4363,16 +4665,11 @@ async fn mark_local_audio_session_failed(
         player.stop();
     }
 
-    let matches_session = music
+    if music
         .playback_state()
-        .is_some_and(|current| current.session_id == state.session_id);
-    if matches_session {
-        let invalidated_vote = music.cancel_playback(&state.session_id);
+        .is_some_and(|current| current.session_id == state.session_id)
+    {
         let _ = ui.send(UiEvent::Playback(None)).await;
-        if let Some(invalidated_vote) = invalidated_vote {
-            let _ = ui.send(UiEvent::Vote(None)).await;
-            send_status(ui, invalidated_vote.reason.to_string()).await;
-        }
     }
 
     send_status(
@@ -5310,6 +5607,34 @@ fn publish_playback_buffer_cancel(
     )
 }
 
+async fn abandon_local_buffer_operation(
+    buffer: &mut BufferCoordinator,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    topic: &gossipsub::IdentTopic,
+    targets: &PublishTargets<'_>,
+    local_peer_id: PeerId,
+    reason: &str,
+    ui: &mpsc::Sender<UiEvent>,
+) {
+    let Some(operation) = buffer.clear_if_local_leader(&local_peer_id.to_string()) else {
+        return;
+    };
+
+    if let Err(err) = publish_playback_buffer_cancel(
+        swarm,
+        topic,
+        targets,
+        &operation.operation_id,
+        &operation.state.session_id,
+        local_peer_id,
+        reason,
+    ) {
+        send_status(ui, format!("buffer cancel not sent: {err:#}")).await;
+    }
+    let _ = ui.send(UiEvent::PlaybackBuffer(None)).await;
+    send_status(ui, format!("buffer canceled: {reason}")).await;
+}
+
 fn cancel_local_pending_playback(
     music: &mut MusicState,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -5386,10 +5711,11 @@ async fn apply_playback_prepare(
     };
 
     send_status(ui, format!("preparing {}", track.title)).await;
-    if audio_player.is_none() {
+    if !ensure_audio_output(audio_player, ui, "playback prepare").await {
         send_status(
             ui,
-            "audio output unavailable; confirming prepare".to_string(),
+            "audio output unavailable locally; confirming prepare so the room can continue"
+                .to_string(),
         )
         .await;
         return Ok(true);
@@ -5526,6 +5852,13 @@ async fn apply_remote_playback_state(
         return Ok(());
     }
 
+    let invalidated_vote = music.set_playback_state(state.clone());
+    send_playback_view(ui, state).await;
+    if let Some(invalidated_vote) = invalidated_vote {
+        let _ = ui.send(UiEvent::Vote(None)).await;
+        send_status(ui, invalidated_vote.reason.to_string()).await;
+    }
+
     if let Some(track) = &state.track {
         if let Some(player) = audio_player.as_mut() {
             if player.current_track_id() != Some(track.track_id.as_str())
@@ -5551,12 +5884,6 @@ async fn apply_remote_playback_state(
         }
     }
 
-    let invalidated_vote = music.set_playback_state(state.clone());
-    send_playback_view(ui, state).await;
-    if let Some(invalidated_vote) = invalidated_vote {
-        let _ = ui.send(UiEvent::Vote(None)).await;
-        send_status(ui, invalidated_vote.reason.to_string()).await;
-    }
     Ok(())
 }
 
@@ -6123,8 +6450,99 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn stream_event_matching_requires_current_session_and_track() {
+        let leader = peer_id();
+        let state = playback_state(leader, true, 0, 1_000_000, 10_000);
+        let mut music = MusicState::default();
+        let buffer = BufferCoordinator::new();
+
+        music.set_playback_state(state.clone());
+
+        assert!(music_stream_event_matches(&music, "session", "track"));
+        assert!(stream_event_matches_current(
+            &buffer, &music, "session", "track"
+        ));
+        assert!(!music_stream_event_matches(
+            &music,
+            "session",
+            "other-track"
+        ));
+        assert!(!music_stream_event_matches(
+            &music,
+            "other-session",
+            "track"
+        ));
+
+        let mut idle = state;
+        idle.track = None;
+        music.set_playback_state(idle);
+        assert!(!music_stream_event_matches(&music, "session", "track"));
+    }
+
+    #[test]
+    fn stream_event_matching_accepts_only_active_buffer_operation() {
+        let leader = peer_id();
+        let mut buffer = BufferCoordinator::new();
+        let music = MusicState::default();
+        let state = playback_state(leader, false, 2_000, 1_000_000, 10_000);
+
+        buffer.start_leader_operation(
+            "op".to_string(),
+            state,
+            PlaybackBufferOperationKind::Seek,
+            None,
+            HashSet::from([leader.to_string()]),
+            Instant::now() + Duration::from_secs(10),
+        );
+
+        assert!(active_buffer_operation_matches(
+            &buffer, "op", "session", "track"
+        ));
+        assert!(stream_event_matches_current(
+            &buffer, &music, "session", "track"
+        ));
+        assert!(!active_buffer_operation_matches(
+            &buffer, "other-op", "session", "track"
+        ));
+        assert!(!active_buffer_operation_matches(
+            &buffer,
+            "op",
+            "other-session",
+            "track"
+        ));
+        assert!(!active_buffer_operation_matches(
+            &buffer,
+            "op",
+            "session",
+            "other-track"
+        ));
+        assert!(!stream_event_matches_current(
+            &buffer,
+            &music,
+            "other-session",
+            "track"
+        ));
+    }
+
+    #[test]
+    fn audio_output_error_classification_is_narrow() {
+        assert!(is_audio_output_error(&anyhow!(
+            "failed to create audio sink after reopening output device"
+        )));
+        assert!(is_audio_output_error(&anyhow!(
+            "failed to configure default audio output"
+        )));
+        assert!(!is_audio_output_error(&anyhow!(
+            "failed to decode streaming audio packet"
+        )));
+        assert!(!is_audio_output_error(&anyhow!(
+            "media range request failed"
+        )));
+    }
+
     #[tokio::test]
-    async fn local_audio_failure_clears_matching_follower_session() {
+    async fn local_audio_failure_keeps_room_playback_state_for_convergence() {
         let leader = peer_id();
         let state = playback_state(leader, false, 0, 1_000_000, 1_000);
         let mut music = MusicState::default();
@@ -6143,7 +6561,13 @@ mod tests {
         .await;
 
         assert!(failed_audio_sessions.contains(&state.session_id));
-        assert!(music.playback_state().is_none());
+        assert_eq!(
+            music
+                .playback_state()
+                .map(|state| state.session_id.as_str()),
+            Some(state.session_id.as_str())
+        );
+        assert!(!music.can_start_next());
         assert!(matches!(ui_rx.recv().await, Some(UiEvent::Playback(None))));
         assert!(
             matches!(ui_rx.recv().await, Some(UiEvent::Status(status)) if status.contains("decode failed"))

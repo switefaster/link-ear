@@ -16,6 +16,7 @@ use link_ear::{
 };
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{Mutex, mpsc};
 
@@ -118,6 +119,14 @@ async fn extract_bilibili_bvid(text: String) -> Result<Option<String>, String> {
     bilibili::extract_bvid_from_text_or_short_link(&client, &text)
         .await
         .map_err(|err| format!("{err:#}"))
+}
+
+#[tauri::command]
+async fn read_clipboard_text(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || app.clipboard().read_text())
+        .await
+        .map_err(|err| format!("clipboard read task failed: {err}"))?
+        .map_err(|err| format!("failed to read clipboard: {err}"))
 }
 
 #[tauri::command]
@@ -321,6 +330,7 @@ mod tests {
 fn main() {
     tauri::Builder::default()
         .manage(BackendState::default())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
             if !matches!(event, WindowEvent::CloseRequested { .. }) {
@@ -350,6 +360,7 @@ fn main() {
             send_chat,
             enqueue_bilibili,
             extract_bilibili_bvid,
+            read_clipboard_text,
             show_queue,
             pause,
             resume,

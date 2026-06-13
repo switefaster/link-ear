@@ -423,6 +423,9 @@ impl AudioPlayer {
             )
             .await
             {
+                if download_fail_bytes.is_canceled() {
+                    return;
+                }
                 let message = format!("{err:#}");
                 download_fail_bytes.fail(message.clone());
                 let _ = event_tx.send(AudioPlayerEvent::Failed {
@@ -714,8 +717,9 @@ impl AudioPlayer {
 fn open_default_output(
     event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
 ) -> Result<MixerDeviceSink> {
+    let diagnostics = default_output_diagnostics();
     DeviceSinkBuilder::from_default_device()
-        .context("failed to configure default audio output")?
+        .with_context(|| format!("failed to configure default audio output ({diagnostics})"))?
         .with_error_callback(move |err| {
             let _ = event_tx.send(AudioPlayerEvent::OutputDeviceError {
                 error: err.to_string(),
@@ -730,6 +734,24 @@ fn default_output_device_id() -> Option<String> {
         .default_output_device()
         .and_then(|device| device.id().ok())
         .map(|id| id.to_string())
+}
+
+fn default_output_diagnostics() -> String {
+    let host = cpal::default_host();
+    let host_id = format!("{:?}", host.id());
+    let Some(device) = host.default_output_device() else {
+        return format!("host={host_id}, default_device=none");
+    };
+
+    let description = device
+        .description()
+        .map(|description| format!("{description:?}"))
+        .unwrap_or_else(|err| format!("unknown ({err})"));
+    let id = device
+        .id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|err| format!("unknown ({err})"));
+    format!("host={host_id}, default_device={description}, device_id={id}")
 }
 
 impl AudioDeviceWatcher {
@@ -1713,13 +1735,16 @@ fn decode_streaming_audio(
     if let Err(err) = decode_streaming_audio_inner(
         bytes,
         pcm.clone(),
-        decoder_token,
+        decoder_token.clone(),
         event_tx.clone(),
         operation_id.clone(),
         session_id.clone(),
         track.clone(),
         position_ms,
     ) {
+        if decoder_token.is_canceled() {
+            return;
+        }
         let error = format!("{err:#}");
         pcm.fail(error.clone());
         let _ = event_tx.send(AudioPlayerEvent::Failed {

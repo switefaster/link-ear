@@ -213,6 +213,25 @@ Current rules:
   `SlowPeer` reports remove that peer from the expected set and recompute quorum.
   Temporary prepare/status publish failures are visible status events, not
   reasons to abort local prepare, local ready, or leader-side quorum resolution.
+- Local output availability must not block the room. If the default output
+  cannot be opened, the peer reports prepare/quorum readiness so other peers can
+  continue, shows a local status, and keeps retrying output recovery while
+  playback or buffer preparation is active.
+- If remote authoritative playback or a remote buffer prepare supersedes a local
+  buffer operation, the local operation is abandoned and canceled without
+  removing its queue item. The resulting local `stream canceled` event is stale
+  cleanup, not a media failure.
+- Local audio player events are accepted only when their operation/session/track
+  still matches the current buffer operation or room playback state. This keeps
+  canceled downloader/decoder tasks from publishing stale health, stale cache
+  views, or late failures for a session that has already been superseded.
+- Follower-side local media failure stops local audio and clears the local
+  playback view, but it keeps the room playback state in `MusicState` so queue
+  sync or peer churn cannot accidentally trigger the next queued item.
+- Output-open failures include the cpal host, default-device description, and
+  stable device id when available. This is especially useful for Linux/Wayland
+  reports where PipeWire/ALSA default device configuration may be missing even
+  though the rest of the room state is healthy.
 - Direct seek by the current track requester still avoids a vote, but it pauses
   first and waits for buffer quorum before publishing the target anchor.
 - `PlaybackReady` counts only when the local peer is leader, session matches, and the ready peer is expected.
@@ -266,6 +285,9 @@ The player also polls the default output device id every second while playing
 and every five seconds while idle, which provides a cross-platform default
 device change watcher without platform-specific callbacks. This recovery must
 not publish a room playback change or mark the media session failed by itself.
+If an output error or device-change event arrives while no track/session is
+loaded, the backend drops the stale output handle and reopens lazily on the next
+playback prepare instead of repeatedly rebuilding an idle stream.
 
 When seek targets a position outside the decoded window, the player restarts the
 streaming prepare at that target and prioritizes the byte ranges requested by
@@ -298,6 +320,11 @@ the current UI log entries as JSONL and calls a Tauri command; Rust uses the
 Tauri dialog plugin to show a save dialog, writes to the selected path, and
 returns the saved path. The desktop app should not rely on WebView Blob download
 behavior for this export.
+
+Clipboard-based queue auto-fill uses a Rust-side Tauri clipboard-manager command
+first, with WebView `navigator.clipboard` only as a fallback. The Rust command
+runs clipboard reads off the main thread so Linux clipboard providers cannot
+freeze the app while serving data.
 
 The desktop UI should keep these behaviours:
 
