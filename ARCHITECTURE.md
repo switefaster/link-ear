@@ -240,6 +240,14 @@ Playback does not stream audio from peer to peer. Each client resolves and strea
 
 The resolver prefers DASH audio and can fall back to single-file `durl` media. WBI signing and media selection helpers have deterministic unit tests. If a playurl response is HTTP 412 or contains no usable media URL, the backend tries the legacy playurl path before surfacing failure. Resolve does not download a partial media Range to prove decoder support; partial metadata and AAC decoder limits are handled by streaming prepare so a valid queue item is not rejected too early.
 
+Bilibili DASH audio may include `SegmentBase` byte ranges for fragmented MP4
+initialization and index metadata. These ranges are carried as optional media
+hints on `PlaybackTrack`; old messages without them still deserialize, and the
+fields are not room playback truth. The streaming cache requests those
+metadata ranges before playback-window or seek ranges so Symphonia can probe the
+container with the required init/index data instead of failing on an isolated
+`.m4s` fragment.
+
 AAC decoding is feature-gated. Default builds use Symphonia's native AAC decoder and only prefer AAC-LC media (`mp4a.40.2`). `cargo check --features fdk-aac-decoder` enables `symphonia-adapter-fdk-aac`, registers its AAC decoder instead of native AAC, and allows HE-AAC candidates (`mp4a.40.5` / `mp4a.40.29`). This feature is not part of the default CI path because it introduces native FDK AAC build and licensing constraints.
 
 Range fetch and decode run outside the main swarm event loop. Skip/cancel/vote messages can arrive while media work is in flight. Player events must be checked against the current session id, operation id, and track id before changing quorum or playback state.

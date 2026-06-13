@@ -74,6 +74,10 @@ guardrail:
   resolve-time decoder probe that can reject otherwise usable tracks because of
   partial Range metadata, missing `moov`, or decoder-specific AAC limitations;
   decode failures belong to streaming prepare and must converge there.
+- When Bilibili DASH audio includes `SegmentBase`, preserve the initialization
+  and index byte ranges on `PlaybackTrack`. The streaming cache should request
+  those metadata ranges before probing or seeking so fragmented MP4 audio can be
+  demuxed without waiting for unrelated sequential download progress.
 - AAC decoding defaults to Symphonia's native decoder on the normal build. The
   optional `fdk-aac-decoder` feature registers the FDK AAC Symphonia adapter
   instead and must stay opt-in because it brings native/library licensing

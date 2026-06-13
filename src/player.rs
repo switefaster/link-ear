@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs::{self, OpenOptions},
     io::{Cursor, Read, Seek, SeekFrom, Write},
     num::{NonZeroU16, NonZeroU32},
@@ -103,7 +104,7 @@ struct StreamingBytesState {
     canceled: bool,
     error: Option<String>,
     ranges: media_cache::RangeIndex,
-    requested_offset: Option<u64>,
+    requested_offsets: VecDeque<u64>,
 }
 
 #[derive(Clone)]
@@ -1160,7 +1161,7 @@ impl SharedBytes {
                     canceled: false,
                     error: None,
                     ranges: media_cache::RangeIndex::default(),
-                    requested_offset: None,
+                    requested_offsets: VecDeque::new(),
                 }),
                 Condvar::new(),
             )),
@@ -1185,15 +1186,10 @@ impl SharedBytes {
             state.chunks.sort_by_key(|chunk| chunk.range.start);
             state.ranges.insert(range);
         }
-        if state.requested_offset.is_some_and(|offset| {
-            state
-                .ranges
-                .ranges()
-                .iter()
-                .any(|range| range.contains(offset))
-        }) {
-            state.requested_offset = None;
-        }
+        let ranges = state.ranges.ranges().to_vec();
+        state
+            .requested_offsets
+            .retain(|offset| !ranges.iter().any(|range| range.contains(*offset)));
         condvar.notify_all();
     }
 
@@ -1247,7 +1243,9 @@ impl SharedBytes {
             .iter()
             .any(|range| range.contains(offset))
         {
-            state.requested_offset = Some(offset);
+            if !state.requested_offsets.contains(&offset) {
+                state.requested_offsets.push_back(offset);
+            }
         }
         condvar.notify_all();
     }
@@ -1255,17 +1253,18 @@ impl SharedBytes {
     fn take_requested_offset(&self, total: u64) -> Option<u64> {
         let (lock, _) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
-        let offset = state.requested_offset.take()?.min(total.saturating_sub(1));
-        if state
-            .ranges
-            .ranges()
-            .iter()
-            .any(|range| range.contains(offset))
-        {
-            None
-        } else {
-            Some(offset)
+        while let Some(offset) = state.requested_offsets.pop_front() {
+            let offset = offset.min(total.saturating_sub(1));
+            if !state
+                .ranges
+                .ranges()
+                .iter()
+                .any(|range| range.contains(offset))
+            {
+                return Some(offset);
+            }
         }
+        None
     }
 
     fn contiguous_prefix_end(&self) -> Option<u64> {
@@ -1318,7 +1317,9 @@ impl SharedBytes {
                 return Ok(0);
             }
             if !decoder.is_canceled() {
-                state.requested_offset = Some(offset);
+                if !state.requested_offsets.contains(&offset) {
+                    state.requested_offsets.push_back(offset);
+                }
             }
             condvar.notify_all();
             let (next, _) = condvar
@@ -1645,6 +1646,9 @@ async fn download_streaming_bytes(
     let mut next_sequential = shared
         .contiguous_prefix_end()
         .map_or(0, |end| end.saturating_add(1));
+    for range in media_cache::metadata_ranges(&track, total) {
+        shared.request_offset(range.start);
+    }
     if position_ms > 0 {
         let seek_window = media_cache::range_for_window(position_ms, track.duration_ms, total);
         shared.request_offset(seek_window.start);
@@ -2093,6 +2097,25 @@ mod tests {
             2
         );
         assert_eq!(buf, [11, 12]);
+    }
+
+    #[test]
+    fn shared_bytes_keeps_multiple_requested_offsets_in_order() {
+        let bytes = SharedBytes::new();
+        bytes.set_total(Some(1_000));
+
+        bytes.request_offset(500);
+        bytes.request_offset(20);
+        bytes.request_offset(500);
+
+        assert_eq!(bytes.take_requested_offset(1_000), Some(500));
+        assert_eq!(bytes.take_requested_offset(1_000), Some(20));
+        assert_eq!(bytes.take_requested_offset(1_000), None);
+
+        bytes.request_offset(40);
+        bytes.request_offset(80);
+        bytes.append(&[1, 2, 3, 4], media_cache::ByteRange::new(40, 43).unwrap());
+        assert_eq!(bytes.take_requested_offset(1_000), Some(80));
     }
 
     #[test]

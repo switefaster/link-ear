@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::header::{ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, RANGE};
 
-use crate::core::PlaybackTrack;
+use crate::core::{PlaybackByteRange, PlaybackTrack};
 
 pub(crate) const READY_WINDOW_MS: u64 = 12_000;
 pub(crate) const LOW_WATERMARK_MS: u64 = 5_000;
@@ -69,6 +69,15 @@ impl ByteRange {
 
     pub(crate) fn header_value(&self) -> String {
         format!("bytes={}-{}", self.start, self.end_inclusive)
+    }
+}
+
+impl From<PlaybackByteRange> for ByteRange {
+    fn from(range: PlaybackByteRange) -> Self {
+        Self {
+            start: range.start,
+            end_inclusive: range.end_inclusive,
+        }
     }
 }
 
@@ -161,6 +170,25 @@ pub(crate) fn range_for_window(position_ms: u64, duration_ms: u64, total_bytes: 
         start,
         end_inclusive: end.max(start),
     }
+}
+
+pub(crate) fn metadata_ranges(track: &PlaybackTrack, total_bytes: u64) -> Vec<ByteRange> {
+    [track.media_init_range, track.media_index_range]
+        .into_iter()
+        .flatten()
+        .filter_map(|range| clamp_track_range(range.into(), total_bytes))
+        .collect()
+}
+
+pub(crate) fn clamp_track_range(range: ByteRange, total_bytes: u64) -> Option<ByteRange> {
+    if total_bytes == 0 || range.start >= total_bytes {
+        return None;
+    }
+    Some(ByteRange {
+        start: range.start,
+        end_inclusive: range.end_inclusive.min(total_bytes.saturating_sub(1)),
+    })
+    .filter(|range| range.start <= range.end_inclusive)
 }
 
 pub(crate) fn parse_range_probe(headers: &HeaderMap) -> RangeProbe {
@@ -401,6 +429,8 @@ mod tests {
             duration_ms: 120_000,
             audio_url: "https://example.test/audio.m4s?token=secret".to_string(),
             referer: "https://www.bilibili.com/video/BV196Ex61ES1".to_string(),
+            media_init_range: None,
+            media_index_range: None,
         }
     }
 
@@ -448,6 +478,33 @@ mod tests {
         assert_eq!(range.start, 600_000);
         assert!(range.end_inclusive > 750_000);
         assert!(range.end_inclusive < 1_200_000);
+    }
+
+    #[test]
+    fn metadata_ranges_preserve_and_clamp_track_segment_base() {
+        let mut track = track();
+        track.media_init_range = Some(PlaybackByteRange {
+            start: 0,
+            end_inclusive: 817,
+        });
+        track.media_index_range = Some(PlaybackByteRange {
+            start: 818,
+            end_inclusive: 24_417,
+        });
+
+        assert_eq!(
+            metadata_ranges(&track, 10_000),
+            vec![
+                ByteRange {
+                    start: 0,
+                    end_inclusive: 817,
+                },
+                ByteRange {
+                    start: 818,
+                    end_inclusive: 9_999,
+                },
+            ]
+        );
     }
 
     #[test]
