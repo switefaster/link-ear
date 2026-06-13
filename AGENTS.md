@@ -90,6 +90,10 @@ guardrail:
 - Start, seek, and resume should wait for a strict majority of real room peers
   to report buffered readiness before the leader publishes the playable
   `PlaybackState`. Queue items are removed only after start quorum succeeds.
+- Local audio output availability must not block the room. If output cannot be
+  opened, try to restore it first; if that fails, report ready for prepare/quorum
+  so other peers can continue, send a local status, and keep retrying output
+  recovery while playback or buffer preparation is active.
 - Buffer quorum counts real room peers only, including the local peer and
   excluding relay/rendezvous infrastructure. Leader-side media failure must
   cancel or converge the operation; follower failure should stay local except
@@ -122,18 +126,36 @@ guardrail:
 - Cache progress is local UI state. `PlaybackCache` is sent to the desktop to
   render local cached/decoded progress and must not be mirrored into
   `PlaybackState`.
-- Music download, decode, device, or playback-sync failures must converge
-  explicitly instead of leaving a peer in fake playback. A leader failure should
+- Music download, decode, or playback-sync failures must converge explicitly
+  instead of leaving a peer in fake playback. A leader failure should
   publish cancel/idle for the affected session and then try the next queued
   item; a follower failure should stop local playback, clear the local playback
   view, and suppress re-applying the failed session until a new session or idle
-  state arrives.
+  state arrives, but it must not erase the room playback state from
+  `MusicState` or make `start_next_if_idle` think the peer is idle.
+- If a local buffer operation is superseded by remote authoritative playback or
+  a remote buffer prepare, abandon/cancel the local operation without consuming
+  its queue item. A later local `stream canceled` event from the abandoned
+  operation is not a media failure and must not skip the queued track.
+- Audio player `Prepared`, `Cache`, `Buffering`, `Failed`, and `Ended` events
+  must match the current buffer operation or the current playback
+  `session_id + track_id` before they update buffer health, UI cache state,
+  status, or playback failure handling. Stale events from canceled decoder or
+  downloader tasks should be ignored silently.
 - Local audio output device errors, such as headphone hotplug or default-device
   changes, should reopen the default output and reattach the current sink when
   possible. The player also polls the cross-platform default output device id
   while active (about 1s) and idle (about 5s) to notice default-device changes
   without platform-specific listeners. This is local recovery and must not
   publish room playback changes or mark the media session failed by itself.
+- If an output error or default-device change arrives while no track/session is
+  loaded, drop the old output handle and reopen lazily on the next playback
+  prepare instead of repeatedly rebuilding an idle stream.
+- If the app starts before Linux/Wayland audio output is available, keep the
+  backend running and retry opening the default output while playback or buffer
+  preparation is active. Include host/default-device diagnostics in output-open
+  errors so user logs identify missing default devices versus sink-open
+  failures.
 - Each peer may cast only one ballot per vote. Votes should resolve early when
   they reach majority or when remaining pending peers can no longer make the
   vote pass. UI vote views should expose approvals, rejections, pending count,
@@ -188,6 +210,9 @@ guardrail:
   may auto-follow only while the user is already near the latest message. The
   chat composer should handle IME composition correctly on Linux/WebKit as well
   as Windows.
+- Clipboard-based Bilibili auto-fill should use the Tauri clipboard-manager
+  command first and fall back to the WebView `navigator.clipboard` API only if
+  the command fails. On Linux, clipboard reads must not run on the main thread.
 - Peer display names are UI aliases learned from name claims and chat/history
   records. Queue requester and playback leader labels should use those aliases
   when available, but peer id remains the unique identity.

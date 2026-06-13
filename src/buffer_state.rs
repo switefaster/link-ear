@@ -262,6 +262,18 @@ impl BufferCoordinator {
         self.active.take()
     }
 
+    pub(crate) fn clear_if_local_leader(&mut self, local_peer_id: &str) -> Option<BufferOperation> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|operation| operation.state.leader_peer_id == local_peer_id)
+        {
+            self.active.take()
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn clear_matching_playback_state(
         &mut self,
         state: &PlaybackState,
@@ -409,6 +421,38 @@ mod tests {
 
     fn peers<const N: usize>(ids: [&str; N]) -> HashSet<String> {
         ids.into_iter().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn clear_if_local_leader_does_not_clear_remote_operation() {
+        let now = Instant::now();
+        let mut coordinator = BufferCoordinator::new();
+        let mut local_state = state("local-session");
+        local_state.leader_peer_id = "local".to_string();
+        coordinator.start_leader_operation(
+            "local-op".to_string(),
+            local_state,
+            PlaybackBufferOperationKind::Start,
+            Some("queue-item".to_string()),
+            peers(["local", "remote"]),
+            now + Duration::from_secs(10),
+        );
+
+        let cleared = coordinator.clear_if_local_leader("local").unwrap();
+        assert_eq!(cleared.operation_id, "local-op");
+        assert!(!coordinator.is_active());
+
+        coordinator.receive_remote_operation(
+            "remote-op".to_string(),
+            state("remote-session"),
+            PlaybackBufferOperationKind::Resume,
+            peers(["local", "remote"]),
+            Duration::from_secs(10),
+            now,
+        );
+
+        assert!(coordinator.clear_if_local_leader("local").is_none());
+        assert!(coordinator.is_active());
     }
 
     #[test]
