@@ -36,6 +36,8 @@ use crate::{
     media_cache,
 };
 
+const MEDIA_RANGE_FETCH_ATTEMPTS: usize = 3;
+
 pub struct AudioPlayer {
     stream: MixerDeviceSink,
     sink: Option<Player>,
@@ -1787,7 +1789,32 @@ async fn download_streaming_bytes(
             }
             continue;
         }
-        let (bytes, _) = media_cache::fetch_range_bytes(&client, &track, range).await?;
+        let mut fetched = None;
+        for attempt in 0..MEDIA_RANGE_FETCH_ATTEMPTS {
+            if shared.is_canceled() {
+                return Ok(());
+            }
+
+            match media_cache::fetch_range_bytes(&client, &track, range).await {
+                Ok(result) => {
+                    fetched = Some(result);
+                    break;
+                }
+                Err(_) if attempt + 1 < MEDIA_RANGE_FETCH_ATTEMPTS => {
+                    let delay_ms = 200 * (attempt as u64 + 1);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to read media range {}-{} after {} attempts",
+                            range.start, range.end_inclusive, MEDIA_RANGE_FETCH_ATTEMPTS
+                        )
+                    });
+                }
+            }
+        }
+        let (bytes, _) = fetched.expect("range fetch succeeded or returned");
         write_cache_chunk(&media_path, start, &bytes)?;
         shared.append(&bytes, range);
         next_sequential = shared

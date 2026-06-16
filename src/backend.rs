@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use futures::StreamExt;
 use libp2p::{
@@ -37,8 +37,8 @@ use crate::{
     core::{
         ChatRecord, FrontendEvent as UiEvent, MAX_MESSAGES, NetworkCommand, PeerNameClaim,
         PeerNameView, PlaybackBufferOperationKind, PlaybackBufferStatusKind, PlaybackCacheStatus,
-        PlaybackCacheView, PlaybackState, PlaybackView, QueueItem, QueueState, VoteAction,
-        VoteProposal, WireMessage, normalize_timestamp_micros,
+        PlaybackCacheView, PlaybackState, PlaybackTrack, PlaybackView, QueueItem, QueueState,
+        VoteAction, VoteProposal, WireMessage, normalize_timestamp_micros,
     },
     media_cache,
     music_state::{
@@ -130,6 +130,65 @@ enum FinishedPlaybackRole {
     Follower,
 }
 
+#[derive(Default)]
+struct LocalMediaResolver {
+    bilibili_tracks: HashMap<String, PlaybackTrack>,
+}
+
+impl LocalMediaResolver {
+    fn remember(&mut self, track: &PlaybackTrack) {
+        if let Some(key) = local_media_key(track) {
+            self.bilibili_tracks.insert(key, track.clone());
+        }
+    }
+
+    fn invalidate(&mut self, track: &PlaybackTrack) {
+        if let Some(key) = local_media_key(track) {
+            self.bilibili_tracks.remove(&key);
+        }
+    }
+
+    async fn playable_track(
+        &mut self,
+        client: &reqwest::Client,
+        track: &PlaybackTrack,
+    ) -> Result<PlaybackTrack> {
+        let Some(key) = local_media_key(track) else {
+            return Ok(track.clone());
+        };
+
+        if let Some(local) = self.bilibili_tracks.get(&key) {
+            return Ok(merge_local_media(track, local));
+        }
+
+        let resolved = bilibili::resolve_track(client, &track.bvid, track.part.saturating_sub(1))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve local bilibili media {} part {}",
+                    track.bvid, track.part
+                )
+            })?;
+        let playable = merge_local_media(track, &resolved);
+        self.bilibili_tracks.insert(key, resolved);
+        Ok(playable)
+    }
+}
+
+fn local_media_key(track: &PlaybackTrack) -> Option<String> {
+    (track.source_kind == "bilibili" && !track.bvid.is_empty() && track.part > 0)
+        .then(|| format!("bilibili:{}:{}", track.bvid, track.part))
+}
+
+fn merge_local_media(shared: &PlaybackTrack, local: &PlaybackTrack) -> PlaybackTrack {
+    let mut playable = shared.clone();
+    playable.audio_url = local.audio_url.clone();
+    playable.referer = local.referer.clone();
+    playable.media_init_range = local.media_init_range;
+    playable.media_index_range = local.media_index_range;
+    playable
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RendezvousDiscoverMode {
     Incremental,
@@ -218,6 +277,7 @@ pub async fn run_network(
         .map_err(|err| anyhow!("invalid rendezvous namespace '{}': {err}", config.topic))?;
     let mut music = MusicState::new();
     let http_client = bilibili::client()?;
+    let mut local_media = LocalMediaResolver::default();
     let mut failed_audio_sessions = HashSet::new();
     let mut buffer_coordinator = BufferCoordinator::new();
     let mut playback_health = PlaybackHealth::new();
@@ -404,6 +464,7 @@ pub async fn run_network(
                     send_status(&ui, format!("resolving bilibili {bvid} part {part}")).await;
                     match bilibili::resolve_track(&http_client, &bvid, part.saturating_sub(1)).await {
                         Ok(track) => {
+                            local_media.remember(&track);
                             let item = QueueItem {
                                 item_id: new_queue_item_id(local_peer_id, &track.track_id),
                                 track,
@@ -428,6 +489,7 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &mut local_media,
                                 &mut failed_audio_sessions,
                                 &mut buffer_coordinator,
                                 &mut swarm,
@@ -461,6 +523,7 @@ pub async fn run_network(
                             &mut music,
                             &mut audio_player,
                             &http_client,
+                            &mut local_media,
                             &mut failed_audio_sessions,
                             &mut buffer_coordinator,
                             &mut swarm,
@@ -488,6 +551,7 @@ pub async fn run_network(
                             &mut music,
                             &mut audio_player,
                             &http_client,
+                            &mut local_media,
                             &mut failed_audio_sessions,
                             &mut buffer_coordinator,
                             &mut swarm,
@@ -537,6 +601,7 @@ pub async fn run_network(
                                 position_ms,
                                 &mut audio_player,
                                 &http_client,
+                                &mut local_media,
                                 &mut failed_audio_sessions,
                                 &mut swarm,
                                 &topic,
@@ -551,6 +616,7 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &mut local_media,
                                 &mut failed_audio_sessions,
                                 &mut buffer_coordinator,
                                 &mut swarm,
@@ -585,6 +651,7 @@ pub async fn run_network(
                             &mut music,
                             &mut audio_player,
                             &http_client,
+                            &mut local_media,
                             &mut failed_audio_sessions,
                             &mut buffer_coordinator,
                             &mut swarm,
@@ -630,6 +697,7 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &mut local_media,
                                 &mut failed_audio_sessions,
                                 &mut buffer_coordinator,
                                 &mut swarm,
@@ -661,6 +729,7 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &mut local_media,
                                 &mut failed_audio_sessions,
                                 &mut buffer_coordinator,
                                 &mut swarm,
@@ -686,6 +755,7 @@ pub async fn run_network(
                         &mut music,
                         &mut audio_player,
                         &http_client,
+                        &mut local_media,
                         &mut failed_audio_sessions,
                         &mut buffer_coordinator,
                         &mut swarm,
@@ -729,6 +799,7 @@ pub async fn run_network(
                         if let Some(state) = music.playback_state().cloned().filter(|state| state.track.is_some()) {
                             if let Err(err) = apply_remote_playback_state(
                                 &http_client,
+                                &mut local_media,
                                 &mut audio_player,
                                 &mut music,
                                 &state,
@@ -762,6 +833,7 @@ pub async fn run_network(
                     &mut music,
                     &mut audio_player,
                     &http_client,
+                    &mut local_media,
                     &mut failed_audio_sessions,
                     &mut buffer_coordinator,
                     &mut playback_health,
@@ -792,6 +864,7 @@ pub async fn run_network(
                     &mut music,
                     &mut audio_player,
                     &http_client,
+                    &mut local_media,
                     &mut failed_audio_sessions,
                     &mut buffer_coordinator,
                     &mut swarm,
@@ -825,6 +898,7 @@ pub async fn run_network(
                     &mut music,
                     &mut audio_player,
                     &http_client,
+                    &mut local_media,
                     &mut failed_audio_sessions,
                     &mut swarm,
                     &topic,
@@ -841,6 +915,7 @@ pub async fn run_network(
                     &mut music,
                     &mut audio_player,
                     &http_client,
+                    &mut local_media,
                     &mut failed_audio_sessions,
                     &mut buffer_coordinator,
                     &mut swarm,
@@ -858,6 +933,7 @@ pub async fn run_network(
                     &mut music,
                     &mut audio_player,
                     &http_client,
+                    &mut local_media,
                     &mut failed_audio_sessions,
                     &mut buffer_coordinator,
                     &mut playback_health,
@@ -908,6 +984,7 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &mut local_media,
                                 &mut failed_audio_sessions,
                                 &mut buffer_coordinator,
                                 &mut swarm,
@@ -961,6 +1038,7 @@ pub async fn run_network(
                                 &mut music,
                                 &mut audio_player,
                                 &http_client,
+                                &mut local_media,
                                 &mut failed_audio_sessions,
                                 &mut buffer_coordinator,
                                 &mut swarm,
@@ -1114,6 +1192,7 @@ pub async fn run_network(
                     queue_request_times: &mut queue_request_times,
                     sync_announcements: &mut sync_announcements,
                     http_client: &http_client,
+                    local_media: &mut local_media,
                     failed_audio_sessions: &mut failed_audio_sessions,
                     buffer_coordinator: &mut buffer_coordinator,
                     playback_health: &mut playback_health,
@@ -1173,6 +1252,7 @@ struct HistoryContext<'a> {
     queue_request_times: &'a mut HashMap<String, Instant>,
     sync_announcements: &'a mut SyncAnnouncementState,
     http_client: &'a reqwest::Client,
+    local_media: &'a mut LocalMediaResolver,
     failed_audio_sessions: &'a mut HashSet<String>,
     buffer_coordinator: &'a mut BufferCoordinator,
     playback_health: &'a mut PlaybackHealth,
@@ -1385,6 +1465,7 @@ async fn handle_swarm_event(
                         ctx.music,
                         &mut *ctx.audio_player,
                         ctx.http_client,
+                        ctx.local_media,
                         ctx.failed_audio_sessions,
                         swarm,
                         ctx.topic,
@@ -1603,6 +1684,7 @@ async fn handle_swarm_event(
                     ctx.music,
                     &mut *ctx.audio_player,
                     ctx.http_client,
+                    ctx.local_media,
                     ctx.failed_audio_sessions,
                     swarm,
                     ctx.topic,
@@ -2563,6 +2645,7 @@ async fn apply_wire_message(
                 );
                 match apply_remote_playback_state(
                     ctx.http_client,
+                    ctx.local_media,
                     &mut *ctx.audio_player,
                     ctx.music,
                     &state,
@@ -2641,6 +2724,7 @@ async fn apply_wire_message(
                 );
                 match apply_playback_prepare(
                     ctx.http_client,
+                    ctx.local_media,
                     &mut *ctx.audio_player,
                     ctx.music,
                     &state,
@@ -2840,13 +2924,21 @@ async fn apply_wire_message(
             let audio_available =
                 ensure_audio_output(&mut *ctx.audio_player, ui, "buffer prepare").await;
             if let Some(player) = ctx.audio_player.as_mut() {
-                if let Err(err) = player.prepare_stream(
-                    ctx.http_client,
-                    Some(operation_id.clone()),
-                    session_id.clone(),
-                    track.clone(),
-                    position_ms,
-                ) {
+                let prepare_result = match ctx
+                    .local_media
+                    .playable_track(ctx.http_client, &track)
+                    .await
+                {
+                    Ok(playable_track) => player.prepare_stream(
+                        ctx.http_client,
+                        Some(operation_id.clone()),
+                        session_id.clone(),
+                        playable_track,
+                        position_ms,
+                    ),
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = prepare_result {
                     let _ = ctx.buffer_coordinator.mark_status(
                         &operation_id,
                         &session_id,
@@ -2947,6 +3039,7 @@ async fn apply_wire_message(
                     ctx.music,
                     &mut *ctx.audio_player,
                     ctx.http_client,
+                    ctx.local_media,
                     ctx.failed_audio_sessions,
                     swarm,
                     ctx.topic,
@@ -3103,6 +3196,7 @@ async fn apply_wire_message(
                 ctx.music,
                 ctx.audio_player,
                 ctx.http_client,
+                ctx.local_media,
                 ctx.failed_audio_sessions,
                 ctx.buffer_coordinator,
                 swarm,
@@ -3232,6 +3326,7 @@ async fn resolve_active_vote_after_queue_apply(
         ctx.music,
         ctx.audio_player,
         ctx.http_client,
+        ctx.local_media,
         ctx.failed_audio_sessions,
         ctx.buffer_coordinator,
         swarm,
@@ -3715,6 +3810,7 @@ async fn handle_audio_player_events(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer: &mut BufferCoordinator,
     playback_health: &mut PlaybackHealth,
@@ -3779,6 +3875,7 @@ async fn handle_audio_player_events(
                             music,
                             audio_player,
                             client,
+                            local_media,
                             failed_audio_sessions,
                             swarm,
                             topic,
@@ -3936,6 +4033,28 @@ async fn handle_audio_player_events(
                 if !matches_current {
                     continue;
                 }
+                if let Some(track) = buffer
+                    .active()
+                    .filter(|operation| {
+                        operation.state.session_id == session_id
+                            && operation
+                                .state
+                                .track
+                                .as_ref()
+                                .is_some_and(|track| track.track_id == track_id)
+                    })
+                    .and_then(|operation| operation.state.track.as_ref())
+                    .or_else(|| {
+                        music
+                            .playback_state()
+                            .filter(|state| {
+                                playback_state_matches_track(state, &session_id, &track_id)
+                            })
+                            .and_then(|state| state.track.as_ref())
+                    })
+                {
+                    local_media.invalidate(track);
+                }
                 let _ = publish_local_buffer_health(
                     playback_health,
                     swarm,
@@ -4005,6 +4124,7 @@ async fn handle_audio_player_events(
                             music,
                             audio_player,
                             client,
+                            local_media,
                             failed_audio_sessions,
                             buffer,
                             swarm,
@@ -4222,6 +4342,7 @@ async fn maybe_pause_for_buffer_health_loss(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer: &mut BufferCoordinator,
     playback_health: &mut PlaybackHealth,
@@ -4280,6 +4401,7 @@ async fn maybe_pause_for_buffer_health_loss(
                 position_ms,
                 audio_player,
                 client,
+                local_media,
                 failed_audio_sessions,
                 swarm,
                 topic,
@@ -4441,6 +4563,7 @@ async fn resolve_buffer_operation(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
@@ -4516,6 +4639,7 @@ async fn resolve_buffer_operation(
                 music,
                 audio_player,
                 client,
+                local_media,
                 swarm,
                 topic,
                 targets,
@@ -4721,6 +4845,7 @@ async fn commit_buffer_operation(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
@@ -4735,11 +4860,12 @@ async fn commit_buffer_operation(
             state.position_ms,
             false,
         )? {
+            let playable_track = local_media.playable_track(client, track).await?;
             player.prepare_stream(
                 client,
                 Some(operation.operation_id.clone()),
                 state.session_id.clone(),
-                track.clone(),
+                playable_track,
                 state.position_ms,
             )?;
             return Ok(false);
@@ -4869,6 +4995,7 @@ async fn start_next_if_idle(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer: &mut BufferCoordinator,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -4895,6 +5022,7 @@ async fn start_next_if_idle(
         0,
         audio_player,
         client,
+        local_media,
         failed_audio_sessions,
         swarm,
         topic,
@@ -4913,6 +5041,7 @@ async fn begin_buffer_operation(
     position_ms: u64,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
@@ -5003,11 +5132,12 @@ async fn begin_buffer_operation(
         return Ok(());
     };
     if let Some(player) = audio_player.as_mut() {
+        let playable_track = local_media.playable_track(client, track).await?;
         player.prepare_stream(
             client,
             Some(operation.operation_id.clone()),
             operation.state.session_id.clone(),
-            track.clone(),
+            playable_track,
             position_ms,
         )?;
     } else {
@@ -5030,6 +5160,7 @@ async fn begin_buffer_operation(
             music,
             audio_player,
             client,
+            local_media,
             failed_audio_sessions,
             swarm,
             topic,
@@ -5079,6 +5210,7 @@ async fn propose_or_execute_vote(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer_coordinator: &mut BufferCoordinator,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -5139,6 +5271,7 @@ async fn propose_or_execute_vote(
         music,
         audio_player,
         client,
+        local_media,
         failed_audio_sessions,
         buffer_coordinator,
         swarm,
@@ -5157,6 +5290,7 @@ async fn cast_vote(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer_coordinator: &mut BufferCoordinator,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -5198,6 +5332,7 @@ async fn cast_vote(
         music,
         audio_player,
         client,
+        local_media,
         failed_audio_sessions,
         buffer_coordinator,
         swarm,
@@ -5215,6 +5350,7 @@ async fn resolve_active_vote(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer_coordinator: &mut BufferCoordinator,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -5283,6 +5419,7 @@ async fn resolve_active_vote(
             music,
             audio_player,
             client,
+            local_media,
             failed_audio_sessions,
             buffer_coordinator,
             swarm,
@@ -5302,6 +5439,7 @@ async fn execute_vote_action(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer_coordinator: &mut BufferCoordinator,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -5361,6 +5499,7 @@ async fn execute_vote_action(
                 position_ms,
                 audio_player,
                 client,
+                local_media,
                 failed_audio_sessions,
                 swarm,
                 topic,
@@ -5384,6 +5523,7 @@ async fn execute_vote_action(
                     music,
                     audio_player,
                     client,
+                    local_media,
                     failed_audio_sessions,
                     buffer_coordinator,
                     swarm,
@@ -5428,6 +5568,7 @@ async fn execute_vote_action(
                 position_ms,
                 audio_player,
                 client,
+                local_media,
                 failed_audio_sessions,
                 swarm,
                 topic,
@@ -5859,6 +6000,7 @@ async fn maybe_start_pending_playback(
 
 async fn apply_playback_prepare(
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     audio_player: &mut Option<player::AudioPlayer>,
     music: &mut MusicState,
     state: &PlaybackState,
@@ -5893,11 +6035,12 @@ async fn apply_playback_prepare(
 
     send_status(ui, format!("streaming {}", track.title)).await;
     if let Some(player) = audio_player.as_mut() {
+        let playable_track = local_media.playable_track(client, track).await?;
         player.prepare_stream(
             client,
             None,
             state.session_id.clone(),
-            track.clone(),
+            playable_track,
             state.position_ms,
         )?;
     }
@@ -6000,6 +6143,7 @@ fn expected_playback_peers(
 
 async fn apply_remote_playback_state(
     client: &reqwest::Client,
+    local_media: &mut LocalMediaResolver,
     audio_player: &mut Option<player::AudioPlayer>,
     music: &mut MusicState,
     state: &PlaybackState,
@@ -6035,11 +6179,12 @@ async fn apply_remote_playback_state(
                 || player.current_session_id() != Some(state.session_id.as_str())
             {
                 send_status(ui, format!("streaming {}", track.title)).await;
+                let playable_track = local_media.playable_track(client, track).await?;
                 player.prepare_stream(
                     client,
                     None,
                     state.session_id.clone(),
-                    track.clone(),
+                    playable_track,
                     desired_position,
                 )?;
             } else {
@@ -6052,11 +6197,12 @@ async fn apply_remote_playback_state(
                         desired_position,
                         should_play,
                     )? {
+                        let playable_track = local_media.playable_track(client, track).await?;
                         player.prepare_stream(
                             client,
                             None,
                             state.session_id.clone(),
-                            track.clone(),
+                            playable_track,
                             desired_position,
                         )?;
                     }
@@ -6274,6 +6420,66 @@ mod tests {
             media_init_range: None,
             media_index_range: None,
         }
+    }
+
+    #[test]
+    fn local_media_key_uses_bilibili_identity() {
+        let media = track("track", 120_000);
+
+        assert_eq!(
+            local_media_key(&media),
+            Some("bilibili:BV1A4411N7:1".to_string())
+        );
+    }
+
+    #[test]
+    fn local_media_key_ignores_non_bilibili_or_incomplete_identity() {
+        let mut media = track("track", 120_000);
+        media.source_kind = "http".to_string();
+        assert!(local_media_key(&media).is_none());
+
+        media = track("track", 120_000);
+        media.bvid.clear();
+        assert!(local_media_key(&media).is_none());
+
+        media = track("track", 120_000);
+        media.part = 0;
+        assert!(local_media_key(&media).is_none());
+    }
+
+    #[test]
+    fn local_media_merge_preserves_shared_metadata_and_uses_local_media() {
+        let mut shared = track("shared-track", 120_000);
+        shared.audio_url = "https://remote.example/audio.m4a".to_string();
+        shared.referer = "https://remote.example/referer".to_string();
+
+        let mut local = shared.clone();
+        local.track_id = "local-track".to_string();
+        local.title = "local title".to_string();
+        local.duration_ms = 240_000;
+        local.audio_url = "https://local.example/audio.m4a".to_string();
+        local.referer = "https://local.example/referer".to_string();
+        local.media_init_range = Some(crate::core::PlaybackByteRange {
+            start: 10,
+            end_inclusive: 20,
+        });
+        local.media_index_range = Some(crate::core::PlaybackByteRange {
+            start: 30,
+            end_inclusive: 40,
+        });
+
+        let playable = merge_local_media(&shared, &local);
+
+        assert_eq!(playable.track_id, shared.track_id);
+        assert_eq!(playable.title, shared.title);
+        assert_eq!(playable.duration_ms, shared.duration_ms);
+        assert_eq!(playable.source_kind, shared.source_kind);
+        assert_eq!(playable.bvid, shared.bvid);
+        assert_eq!(playable.part, shared.part);
+        assert_eq!(playable.audio_url, local.audio_url);
+        assert_eq!(playable.referer, local.referer);
+        assert_eq!(playable.media_init_range, local.media_init_range);
+        assert_eq!(playable.media_index_range, local.media_index_range);
     }
 
     fn playback_state(
