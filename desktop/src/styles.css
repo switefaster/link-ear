@@ -107,6 +107,7 @@ h2 {
 .setup-page,
 .console-page {
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   padding: 18px;
 }
@@ -121,7 +122,8 @@ h2 {
   gap: 16px;
   width: min(100%, 680px);
   max-height: calc(100vh - 36px);
-  overflow: hidden;
+  max-height: calc(100dvh - 36px);
+  overflow: auto;
   padding: 18px;
   border: 1px solid rgba(216, 203, 182, 0.95);
   border-radius: 8px;
@@ -197,7 +199,7 @@ h2 {
 
 .console-page {
   display: grid;
-  grid-template-rows: 58px minmax(0, 1fr) 118px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 12px;
 }
 
@@ -228,11 +230,14 @@ h2 {
 
 .nav-brand {
   gap: 9px;
+  min-width: 0;
 }
 
 .nav-brand strong {
+  overflow: hidden;
   font-size: 18px;
   line-height: 1;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -330,6 +335,7 @@ h2 {
 
 .status-ticker {
   gap: 8px;
+  min-width: 0;
   padding: 5px 9px;
   overflow: hidden;
   color: rgba(241, 236, 223, 0.78);
@@ -359,8 +365,9 @@ h2 {
 }
 
 .queue-nav-button {
-  min-width: 116px;
+  min-width: 0;
   min-height: 38px;
+  padding-inline: 11px;
 }
 
 .console-rail,
@@ -790,6 +797,7 @@ h2 {
   align-items: center;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
   padding: 14px 16px;
   border: 1px solid rgba(216, 203, 182, 0.95);
   border-radius: 8px;
@@ -1001,9 +1009,7 @@ h2 {
 
 .connection-alert strong,
 .connection-alert small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .connection-alert strong {
@@ -1225,6 +1231,7 @@ h2 {
 }
 
 .queue-add-row {
+  display: grid;
   grid-template-columns: minmax(0, 1fr) 78px auto;
 }
 
@@ -1328,13 +1335,13 @@ h2 {
 .queue-move-actions .icon-button {
   width: 30px;
   height: 30px;
-  color: var(--ink-muted);
+  color: var(--muted);
   border: 1px solid var(--line);
   background: #fffaf0;
   box-shadow: none;
 }
 
-.queue-card .icon-button {
+.queue-card > .icon-button {
   width: 36px;
   height: 36px;
 }
@@ -1357,28 +1364,9 @@ h2 {
 }
 
 .track-title.scrolling span {
-  min-width: 100%;
-  max-width: none;
-  padding-right: 40px;
-  overflow: visible;
-  text-overflow: clip;
-  animation: title-marquee 12s linear infinite;
-}
-
-.track-title.scrolling:hover span,
-.track-title.scrolling:focus-within span {
-  animation-play-state: paused;
-}
-
-@keyframes title-marquee {
-  0%,
-  16% {
-    transform: translateX(0);
-  }
-  84%,
-  100% {
-    transform: translateX(-50%);
-  }
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .modal-scrim {
@@ -1392,6 +1380,10 @@ h2 {
   display: grid;
   gap: 14px;
   width: min(440px, 100%);
+  max-height: calc(100vh - 36px);
+  max-height: calc(100dvh - 36px);
+  min-width: 0;
+  overflow: auto;
   padding: 18px;
   border: 1px solid rgba(216, 203, 182, 0.98);
   border-radius: 8px;
@@ -1488,6 +1480,7 @@ h2 {
   grid-template-rows: auto auto auto auto minmax(0, 1fr);
   width: min(720px, 100%);
   max-height: min(680px, calc(100vh - 36px));
+  max-height: min(680px, calc(100dvh - 36px));
   overflow: hidden;
 }
 
@@ -1529,6 +1522,8 @@ h2 {
 }
 
 .log-toolbar select {
+  width: 100%;
+  min-width: 0;
   height: 40px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1617,7 +1612,9 @@ h2 {
 .peer-modal {
   width: min(760px, 100%);
   max-height: min(720px, calc(100vh - 36px));
-  overflow: hidden;
+  max-height: min(720px, calc(100dvh - 36px));
+  align-content: start;
+  overflow: auto;
 }
 
 .peer-modal .icon-button {
@@ -1654,8 +1651,7 @@ h2 {
 .peer-list {
   display: grid;
   gap: 8px;
-  max-height: min(440px, calc(100vh - 270px));
-  overflow: auto;
+  min-height: 0;
 }
 
 .peer-group .empty-state {
@@ -1960,10 +1956,6 @@ h2 {
     grid-template-columns: 1fr;
   }
 
-  .console-page {
-    grid-template-rows: 96px minmax(0, 1fr) 158px;
-  }
-
   .room-navbar {
     grid-template-columns: minmax(0, 1fr) auto;
     grid-template-rows: auto auto;
@@ -1980,6 +1972,9 @@ h2 {
   .player-dock {
     grid-template-columns: minmax(0, 1fr);
     gap: 10px;
+    max-height: min(42vh, 260px);
+    max-height: min(42dvh, 260px);
+    overflow: auto;
   }
 
   .setup-page,
@@ -2000,10 +1995,6 @@ h2 {
   .setup-page,
   .console-page {
     padding: 10px;
-  }
-
-  .console-page {
-    grid-template-rows: 96px minmax(0, 1fr) 272px;
   }
 
   .setup-card {
@@ -2082,5 +2073,118 @@ h2 {
   .log-toolbar,
   .log-summary {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .log-export-button {
+    width: 100%;
+  }
+}
+
+@media (max-width: 520px) {
+  .setup-titlebar {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .backend-state {
+    justify-self: start;
+  }
+
+  .room-navbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 8px;
+  }
+
+  .nav-brand strong {
+    display: none;
+  }
+
+  .queue-nav-button {
+    min-width: 44px;
+    padding-inline: 10px;
+  }
+
+  .queue-drawer {
+    top: 10px;
+    right: 10px;
+    bottom: 10px;
+    width: calc(100vw - 20px);
+    padding: 12px;
+  }
+
+  .queue-add-row {
+    grid-template-columns: minmax(0, 1fr) 72px;
+  }
+
+  .queue-add-row .btn {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .queue-card {
+    grid-template-columns: 24px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "drag track remove"
+      "index track moves";
+    gap: 8px;
+    align-items: center;
+  }
+
+  .queue-drag-handle {
+    grid-area: drag;
+  }
+
+  .queue-index {
+    grid-area: index;
+  }
+
+  .queue-track {
+    grid-area: track;
+  }
+
+  .queue-move-actions {
+    grid-area: moves;
+    justify-self: end;
+  }
+
+  .queue-card > .icon-button {
+    grid-area: remove;
+    justify-self: end;
+  }
+
+  .modal-actions {
+    flex-wrap: wrap;
+  }
+
+  .modal-actions .btn {
+    flex: 1 1 132px;
+  }
+}
+
+@media (max-width: 380px) {
+  .player-dock {
+    padding: 12px;
+  }
+
+  .transport-buttons .icon-button {
+    width: 40px;
+    height: 40px;
+  }
+
+  .volume-control {
+    grid-template-columns: auto minmax(64px, 1fr) 34px;
+    padding-inline: 8px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }

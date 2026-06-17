@@ -64,9 +64,12 @@ function App() {
   const [logOpen, setLogOpen] = useState(false);
   const isConnected = room.backendRunning && Boolean(room.localPeerId);
 
-  if (!import.meta.env.DEV) {
-    document.addEventListener('contextmenu', (e) => e.preventDefault());
-  }
+  useEffect(() => {
+    if (import.meta.env.DEV) return undefined;
+    const preventContextMenu = (event) => event.preventDefault();
+    document.addEventListener("contextmenu", preventContextMenu);
+    return () => document.removeEventListener("contextmenu", preventContextMenu);
+  }, []);
 
   async function exportLogs(entries) {
     try {
@@ -480,6 +483,7 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
         <VoteModal
           vote={room.vote}
           onVote={(approve) => callCommand("vote", { approve })}
+          onDismiss={() => setRoom((current) => ({ ...current, vote: null }))}
           displayName={displayName}
         />
       )}
@@ -1023,7 +1027,7 @@ function ConfirmSeekModal({ seek, onCancel, onConfirm }) {
   );
 }
 
-function VoteModal({ vote, onVote, displayName }) {
+function VoteModal({ vote, onVote, onDismiss, displayName }) {
   const [busy, setBusy] = useState(false);
   const eligible = Math.max(vote.eligible_peers ?? vote.threshold ?? 1, 1);
   const approvalWidth = Math.min(100, (vote.approvals / eligible) * 100);
@@ -1062,6 +1066,11 @@ function VoteModal({ vote, onVote, displayName }) {
           <p className="modal-meta">you voted {localVote ? "yes" : "no"}</p>
         )}
         <div className="modal-actions">
+          {hasVoted && (
+            <button className="btn subtle" type="button" onClick={onDismiss} disabled={busy}>
+              Dismiss
+            </button>
+          )}
           <button className="btn approve" type="button" onClick={() => cast(true)} disabled={busy || hasVoted}>
             <Check size={17} aria-hidden="true" />
             Yes
