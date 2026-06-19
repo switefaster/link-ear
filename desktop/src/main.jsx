@@ -1560,15 +1560,7 @@ async function resolveBilibiliBvidFromClipboard() {
   const text = await readClipboardText();
   if (!text) return null;
 
-  const localBvid = extractBilibiliBvid(text);
-  if (localBvid) return localBvid;
-
-  try {
-    const resolved = await invoke("extract_bilibili_bvid", { text });
-    return typeof resolved === "string" && resolved ? resolved : null;
-  } catch {
-    return null;
-  }
+  return extractBilibiliBvid(text);
 }
 
 async function readClipboardText() {
@@ -1790,8 +1782,6 @@ async function previewInvoke(command, args = {}) {
       emitPreview("backend-event", { type: "status", payload: `queued ${args.bvid || "BV1preview"} part ${args.part || 1}` });
       emitPreview("backend-event", { type: "queue", payload: previewQueue(args) });
       return;
-    case "extract_bilibili_bvid":
-      return extractBilibiliBvid(args.text);
     case "show_queue":
       emitPreview("backend-event", { type: "status", payload: "queue: 1 active, 2 waiting" });
       emitPreview("backend-event", { type: "queue", payload: previewQueue() });
