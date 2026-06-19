@@ -803,6 +803,7 @@ pub async fn run_network(
                                 &mut audio_player,
                                 &mut music,
                                 &state,
+                                local_peer_id,
                                 &ui,
                             ).await {
                                 if handle_local_audio_output_error(
@@ -2649,6 +2650,7 @@ async fn apply_wire_message(
                     &mut *ctx.audio_player,
                     ctx.music,
                     &state,
+                    ctx.local_peer_id,
                     ui,
                 )
                 .await
@@ -2831,6 +2833,17 @@ async fn apply_wire_message(
                 )
                 .ok();
                 let _ = ui.send(UiEvent::PlaybackBuffer(None)).await;
+                return true;
+            }
+
+            if matches!(kind, PlaybackBufferOperationKind::Start)
+                && playback_state_resolves_buffer_prepare(
+                    ctx.music.playback_state(),
+                    &session_id,
+                    &track_id,
+                    &leader_peer_id,
+                )
+            {
                 return true;
             }
 
@@ -4901,6 +4914,61 @@ fn remove_buffer_queue_item(music: &mut MusicState, operation: &BufferOperation)
     }
 }
 
+fn remove_started_playback_queue_item(music: &mut MusicState, state: &PlaybackState) -> bool {
+    let Some(track) = state.track.as_ref() else {
+        return false;
+    };
+
+    let Some(index) = music
+        .queue
+        .iter()
+        .position(|item| queue_item_matches_started_playback(item, state, &track.track_id))
+    else {
+        return false;
+    };
+
+    music.queue.remove(index);
+    true
+}
+
+fn queue_item_matches_started_playback(
+    item: &QueueItem,
+    state: &PlaybackState,
+    track_id: &str,
+) -> bool {
+    if item.track.track_id != track_id {
+        return false;
+    }
+    if state
+        .track_requested_by
+        .as_ref()
+        .is_some_and(|requester| item.requested_by != *requester)
+    {
+        return false;
+    }
+
+    item.added_at_micros <= state.issued_at_micros
+}
+
+fn playback_state_resolves_buffer_prepare(
+    current: Option<&PlaybackState>,
+    session_id: &str,
+    track_id: &str,
+    leader_peer_id: &str,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    if current.session_id != session_id || current.leader_peer_id != leader_peer_id {
+        return false;
+    }
+    let Some(track) = current.track.as_ref() else {
+        return false;
+    };
+
+    track.track_id == track_id
+}
+
 fn find_buffer_track<'a>(
     music: &'a MusicState,
     track_id: &str,
@@ -6147,6 +6215,7 @@ async fn apply_remote_playback_state(
     audio_player: &mut Option<player::AudioPlayer>,
     music: &mut MusicState,
     state: &PlaybackState,
+    local_peer_id: PeerId,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
     let now = current_timestamp_micros();
@@ -6171,6 +6240,9 @@ async fn apply_remote_playback_state(
     if let Some(invalidated_vote) = invalidated_vote {
         let _ = ui.send(UiEvent::Vote(None)).await;
         send_status(ui, invalidated_vote.reason.to_string()).await;
+    }
+    if remove_started_playback_queue_item(music, state) {
+        send_queue_view(ui, local_peer_id, music).await;
     }
 
     if let Some(track) = &state.track {
@@ -6955,6 +7027,83 @@ mod tests {
         let mut idle = playback;
         idle.track = None;
         assert!(should_sync_player_to_playback_state(&buffer, &idle));
+    }
+
+    #[test]
+    fn active_playback_resolves_stale_start_buffer_prepare() {
+        let leader = peer_id();
+        let playback = playback_state(leader, true, 0, 1_000_000, 120_000);
+
+        assert!(playback_state_resolves_buffer_prepare(
+            Some(&playback),
+            "session",
+            "track",
+            &leader.to_string()
+        ));
+        assert!(!playback_state_resolves_buffer_prepare(
+            Some(&playback),
+            "other-session",
+            "track",
+            &leader.to_string()
+        ));
+
+        let mut paused = playback.clone();
+        paused.playing = false;
+        assert!(playback_state_resolves_buffer_prepare(
+            Some(&paused),
+            "session",
+            "track",
+            &leader.to_string()
+        ));
+
+        let other_leader = peer_id();
+        assert!(!playback_state_resolves_buffer_prepare(
+            Some(&playback),
+            "session",
+            "track",
+            &other_leader.to_string()
+        ));
+    }
+
+    #[test]
+    fn started_remote_playback_removes_matching_local_queue_item_without_version_bump() {
+        let leader = peer_id();
+        let requester = leader.to_string();
+        let mut music = MusicState::default();
+        music.queue_version = 7;
+        music.queue_updated_at = 42;
+
+        let mut playback = playback_state(leader, true, 0, 2_000_000, 120_000);
+        playback.track_requested_by = Some(requester.clone());
+        music.append_queue_item(QueueItem {
+            item_id: "played".to_string(),
+            requested_by: requester.clone(),
+            added_at_micros: 1_000_000,
+            track: track("track", 120_000),
+        });
+        music.append_queue_item(QueueItem {
+            item_id: "later-duplicate".to_string(),
+            requested_by: requester,
+            added_at_micros: 3_000_000,
+            track: track("track", 120_000),
+        });
+        music.append_queue_item(QueueItem {
+            item_id: "other".to_string(),
+            requested_by: leader.to_string(),
+            added_at_micros: 1_500_000,
+            track: track("other-track", 120_000),
+        });
+
+        assert!(remove_started_playback_queue_item(&mut music, &playback));
+
+        let remaining = music
+            .queue
+            .iter()
+            .map(|item| item.item_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec!["later-duplicate", "other"]);
+        assert_eq!(music.queue_version, 7);
+        assert_eq!(music.queue_updated_at, 42);
     }
 
     #[test]
