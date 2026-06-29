@@ -42,8 +42,11 @@ const STREAM_BUFFER_RESUME_MS: u64 = media_cache::HIGH_WATERMARK_MS;
 const STREAM_PCM_RETAIN_BEHIND_MS: u64 = media_cache::LOW_WATERMARK_MS;
 const STREAM_PCM_TRIM_GRANULARITY_MS: u64 = 1_000;
 const STREAM_BYTE_RETAIN_BEHIND_BYTES: u64 = media_cache::STREAM_CHUNK_BYTES * 4;
+const STREAM_MAX_PENDING_OFFSETS: usize = 6;
 const STREAM_DOWNLOAD_IDLE_SLEEP_MS: u64 = 250;
-const STREAM_RANGE_FETCH_SPACING_MS: u64 = 100;
+const STREAM_RANGE_REQUEST_SPACING_MS: u64 = 750;
+const STREAM_THROTTLE_RETRY_DELAY_MS: u64 = 10_000;
+const STREAM_TRANSIENT_RETRY_BASE_MS: u64 = 750;
 const STREAM_DECODE_IDLE_SLEEP_MS: u64 = 100;
 
 pub struct AudioPlayer {
@@ -156,6 +159,10 @@ struct DecodeToken {
     canceled: Arc<AtomicBool>,
 }
 
+struct StreamRequestPacer {
+    last_started_at: Option<Instant>,
+}
+
 struct AudioDeviceWatcher {
     known_device_id: Option<String>,
     last_checked: Instant,
@@ -191,6 +198,12 @@ pub enum AudioPlayerEvent {
         track_id: String,
         title: String,
         error: String,
+    },
+    DownloadStatus {
+        operation_id: Option<String>,
+        session_id: String,
+        track_id: String,
+        message: String,
     },
     OutputDeviceError {
         error: String,
@@ -440,6 +453,9 @@ impl AudioPlayer {
                 download_position_ms,
                 download_position,
                 download_bytes,
+                event_tx.clone(),
+                download_operation_id.clone(),
+                download_session_id.clone(),
             )
             .await
             {
@@ -963,13 +979,60 @@ fn stream_byte_range_for_window(
     }
 }
 
+fn align_stream_offset(offset: u64) -> u64 {
+    offset - (offset % media_cache::STREAM_CHUNK_BYTES)
+}
+
 fn stream_fetch_range(start: u64, total_bytes: u64) -> Result<media_cache::ByteRange> {
-    let start = start.min(total_bytes.saturating_sub(1));
+    let start = align_stream_offset(start.min(total_bytes.saturating_sub(1)));
     let end = start
         .saturating_add(media_cache::STREAM_CHUNK_BYTES)
         .saturating_sub(1)
         .min(total_bytes.saturating_sub(1));
     media_cache::ByteRange::new(start, end)
+}
+
+fn media_range_retry_delay(
+    error: &media_cache::MediaRangeError,
+    attempt: usize,
+) -> Option<Duration> {
+    if let Some(status) = error.status() {
+        if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            return (attempt == 0).then(|| Duration::from_millis(STREAM_THROTTLE_RETRY_DELAY_MS));
+        }
+
+        if status.is_server_error() {
+            return (attempt + 1 < MEDIA_RANGE_FETCH_ATTEMPTS)
+                .then(|| transient_range_retry_delay(attempt));
+        }
+
+        return None;
+    }
+
+    match error {
+        media_cache::MediaRangeError::Request { .. }
+        | media_cache::MediaRangeError::Read { .. } => {
+            (attempt + 1 < MEDIA_RANGE_FETCH_ATTEMPTS).then(|| transient_range_retry_delay(attempt))
+        }
+        media_cache::MediaRangeError::UnsupportedRange { .. }
+        | media_cache::MediaRangeError::UnexpectedLength { .. }
+        | media_cache::MediaRangeError::HttpStatus { .. } => None,
+    }
+}
+
+fn transient_range_retry_delay(attempt: usize) -> Duration {
+    let multiplier = 1_u64 << attempt.min(4);
+    Duration::from_millis(STREAM_TRANSIENT_RETRY_BASE_MS.saturating_mul(multiplier))
+}
+
+fn describe_retry_delay(delay: Duration) -> String {
+    if delay.as_secs() > 0 && delay.subsec_millis() == 0 {
+        format!("{}s", delay.as_secs())
+    } else {
+        format!("{}ms", delay.as_millis())
+    }
 }
 
 fn retain_streaming_byte_window(
@@ -1352,6 +1415,65 @@ impl DecodeToken {
     }
 }
 
+impl StreamRequestPacer {
+    fn new() -> Self {
+        Self {
+            last_started_at: None,
+        }
+    }
+
+    async fn wait_for_turn(&mut self, shared: &SharedBytes) -> bool {
+        if let Some(last_started_at) = self.last_started_at {
+            let elapsed = last_started_at.elapsed();
+            let spacing = Duration::from_millis(STREAM_RANGE_REQUEST_SPACING_MS);
+            if elapsed < spacing
+                && !sleep_streaming_download(shared, spacing.saturating_sub(elapsed)).await
+            {
+                return false;
+            }
+        }
+        if shared.is_canceled() {
+            return false;
+        }
+        self.last_started_at = Some(Instant::now());
+        true
+    }
+}
+
+fn normalized_stream_request_offset(offset: u64, total_bytes: Option<u64>) -> u64 {
+    let offset = total_bytes.map_or(offset, |total| offset.min(total.saturating_sub(1)));
+    align_stream_offset(offset)
+}
+
+fn queue_requested_offset(queue: &mut VecDeque<u64>, offset: u64, priority: bool) {
+    if !priority && queue.contains(&offset) {
+        return;
+    }
+    queue.retain(|queued| *queued != offset);
+    if priority {
+        queue.push_front(offset);
+    } else {
+        queue.push_back(offset);
+    }
+    queue.truncate(STREAM_MAX_PENDING_OFFSETS);
+}
+
+async fn sleep_streaming_download(shared: &SharedBytes, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if shared.is_canceled() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(remaining.min(Duration::from_millis(STREAM_DOWNLOAD_IDLE_SLEEP_MS)))
+            .await;
+    }
+}
+
 impl SharedBytes {
     fn new() -> Self {
         Self {
@@ -1469,15 +1591,14 @@ impl SharedBytes {
     fn request_offset(&self, offset: u64) {
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
+        let offset = normalized_stream_request_offset(offset, state.total_bytes);
         if !state
             .ranges
             .ranges()
             .iter()
             .any(|range| range.contains(offset))
         {
-            if !state.requested_offsets.contains(&offset) {
-                state.requested_offsets.push_back(offset);
-            }
+            queue_requested_offset(&mut state.requested_offsets, offset, false);
         }
         condvar.notify_all();
     }
@@ -1485,17 +1606,14 @@ impl SharedBytes {
     fn prioritize_offset(&self, offset: u64) {
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
-        let offset = state
-            .total_bytes
-            .map_or(offset, |total| offset.min(total.saturating_sub(1)));
+        let offset = normalized_stream_request_offset(offset, state.total_bytes);
         if !state
             .ranges
             .ranges()
             .iter()
             .any(|range| range.contains(offset))
         {
-            state.requested_offsets.retain(|queued| *queued != offset);
-            state.requested_offsets.push_front(offset);
+            queue_requested_offset(&mut state.requested_offsets, offset, true);
         }
         condvar.notify_all();
     }
@@ -1504,7 +1622,7 @@ impl SharedBytes {
         let (lock, _) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
         while let Some(offset) = state.requested_offsets.pop_front() {
-            let offset = offset.min(total.saturating_sub(1));
+            let offset = normalized_stream_request_offset(offset, Some(total));
             if !state
                 .ranges
                 .ranges()
@@ -1586,9 +1704,8 @@ impl SharedBytes {
                 return Ok(len);
             }
             if !decoder.is_canceled() {
-                if !state.requested_offsets.contains(&offset) {
-                    state.requested_offsets.push_back(offset);
-                }
+                let offset = normalized_stream_request_offset(offset, state.total_bytes);
+                queue_requested_offset(&mut state.requested_offsets, offset, false);
             }
             condvar.notify_all();
             let (next, _) = condvar
@@ -1953,13 +2070,26 @@ async fn download_streaming_bytes(
     position_ms: u64,
     playback_position: Arc<AtomicU64>,
     shared: SharedBytes,
+    event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
+    operation_id: Option<String>,
+    session_id: String,
 ) -> Result<()> {
     let root = media_cache::cache_root();
     fs::create_dir_all(root.join(media_cache::cache_key(&track)))
         .context("failed to create media cache directory")?;
     let media_path = media_cache::media_file_path(&root, &track);
 
-    let probe = media_cache::probe_range_support(&client, &track).await?;
+    let mut request_pacer = StreamRequestPacer::new();
+    let probe = probe_stream_range_with_retry(
+        &client,
+        &track,
+        &shared,
+        &mut request_pacer,
+        &event_tx,
+        operation_id.as_deref(),
+        &session_id,
+    )
+    .await?;
     let total = probe
         .total_bytes
         .ok_or_else(|| anyhow!("media range probe did not report total length"))?;
@@ -2027,41 +2157,134 @@ async fn download_streaming_bytes(
         if shared.covers(range) {
             continue;
         }
-        let mut fetched = None;
-        for attempt in 0..MEDIA_RANGE_FETCH_ATTEMPTS {
-            if shared.is_canceled() {
-                return Ok(());
-            }
-
-            match media_cache::fetch_range_bytes(&client, &track, range).await {
-                Ok(result) => {
-                    fetched = Some(result);
-                    break;
-                }
-                Err(_) if attempt + 1 < MEDIA_RANGE_FETCH_ATTEMPTS => {
-                    let delay_ms = 200 * (attempt as u64 + 1);
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "failed to read media range {}-{} after {} attempts",
-                            range.start, range.end_inclusive, MEDIA_RANGE_FETCH_ATTEMPTS
-                        )
-                    });
-                }
-            }
-        }
-        let (bytes, _) = fetched.expect("range fetch succeeded or returned");
-        write_cache_chunk(&media_path, start, &bytes)?;
+        let (bytes, _) = fetch_stream_range_with_retry(
+            &client,
+            &track,
+            range,
+            &shared,
+            &mut request_pacer,
+            &event_tx,
+            operation_id.as_deref(),
+            &session_id,
+        )
+        .await?;
+        write_cache_chunk(&media_path, range.start, &bytes)?;
         shared.append(&bytes, range);
         let current_position_ms = playback_position
             .load(Ordering::Relaxed)
             .min(track.duration_ms);
         retain_streaming_byte_window(&shared, current_position_ms, track.duration_ms, total);
         let _ = media_cache::evict_cache(&root, media_cache::MAX_CACHE_BYTES);
-        tokio::time::sleep(Duration::from_millis(STREAM_RANGE_FETCH_SPACING_MS)).await;
     }
+}
+
+async fn probe_stream_range_with_retry(
+    client: &reqwest::Client,
+    track: &PlaybackTrack,
+    shared: &SharedBytes,
+    request_pacer: &mut StreamRequestPacer,
+    event_tx: &mpsc::UnboundedSender<AudioPlayerEvent>,
+    operation_id: Option<&str>,
+    session_id: &str,
+) -> Result<media_cache::RangeProbe> {
+    let mut attempt = 0;
+    loop {
+        if !request_pacer.wait_for_turn(shared).await {
+            return Err(anyhow!("stream canceled"));
+        }
+
+        match media_cache::probe_range_support(client, track).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                let Some(delay) = media_range_retry_delay(&err, attempt) else {
+                    return Err(anyhow::Error::from(err)).context("failed to probe media range");
+                };
+                send_media_retry_status(
+                    event_tx,
+                    operation_id,
+                    session_id,
+                    &track.track_id,
+                    &err,
+                    delay,
+                );
+                if !sleep_streaming_download(shared, delay).await {
+                    return Err(anyhow!("stream canceled"));
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
+async fn fetch_stream_range_with_retry(
+    client: &reqwest::Client,
+    track: &PlaybackTrack,
+    range: media_cache::ByteRange,
+    shared: &SharedBytes,
+    request_pacer: &mut StreamRequestPacer,
+    event_tx: &mpsc::UnboundedSender<AudioPlayerEvent>,
+    operation_id: Option<&str>,
+    session_id: &str,
+) -> Result<(Vec<u8>, media_cache::RangeProbe)> {
+    let mut attempt = 0;
+    loop {
+        if !request_pacer.wait_for_turn(shared).await {
+            return Err(anyhow!("stream canceled"));
+        }
+
+        match media_cache::fetch_range_bytes(client, track, range).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                let Some(delay) = media_range_retry_delay(&err, attempt) else {
+                    return Err(anyhow::Error::from(err)).with_context(|| {
+                        format!(
+                            "failed to read media range {} after {} attempt(s)",
+                            range.header_value(),
+                            attempt + 1
+                        )
+                    });
+                };
+
+                send_media_retry_status(
+                    event_tx,
+                    operation_id,
+                    session_id,
+                    &track.track_id,
+                    &err,
+                    delay,
+                );
+                if !sleep_streaming_download(shared, delay).await {
+                    return Err(anyhow!("stream canceled"));
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
+fn send_media_retry_status(
+    event_tx: &mpsc::UnboundedSender<AudioPlayerEvent>,
+    operation_id: Option<&str>,
+    session_id: &str,
+    track_id: &str,
+    error: &media_cache::MediaRangeError,
+    delay: Duration,
+) {
+    let status = error
+        .status()
+        .map(|status| format!("HTTP {status}"))
+        .unwrap_or_else(|| "transport error".to_string());
+    let message = format!(
+        "media range {} {status}; retrying in {}",
+        error.range(),
+        describe_retry_delay(delay)
+    );
+    let _ = event_tx.send(AudioPlayerEvent::DownloadStatus {
+        operation_id: operation_id.map(str::to_string),
+        session_id: session_id.to_string(),
+        track_id: track_id.to_string(),
+        message,
+    });
 }
 
 fn write_cache_chunk(path: &PathBuf, start: u64, bytes: &[u8]) -> Result<()> {
@@ -2374,11 +2597,11 @@ mod tests {
     }
 
     #[test]
-    fn stream_fetch_range_uses_full_chunks() {
+    fn stream_fetch_range_uses_aligned_full_chunks() {
         let total = media_cache::STREAM_CHUNK_BYTES * 10;
         let range = stream_fetch_range(3_622_827, total).unwrap();
 
-        assert_eq!(range.start, 3_622_827);
+        assert_eq!(range.start, media_cache::STREAM_CHUNK_BYTES);
         assert_eq!(range.len(), media_cache::STREAM_CHUNK_BYTES);
     }
 
@@ -2390,6 +2613,38 @@ mod tests {
         assert_eq!(range.start, media_cache::STREAM_CHUNK_BYTES);
         assert_eq!(range.end_inclusive, media_cache::STREAM_CHUNK_BYTES);
         assert_eq!(range.len(), 1);
+    }
+
+    #[test]
+    fn media_range_retry_policy_backs_off_once_for_cdn_throttle() {
+        let err = media_cache::MediaRangeError::HttpStatus {
+            range: "bytes=0-0".to_string(),
+            status: reqwest::StatusCode::FORBIDDEN,
+        };
+
+        assert_eq!(
+            media_range_retry_delay(&err, 0),
+            Some(Duration::from_millis(STREAM_THROTTLE_RETRY_DELAY_MS))
+        );
+        assert_eq!(media_range_retry_delay(&err, 1), None);
+    }
+
+    #[test]
+    fn media_range_retry_policy_uses_exponential_backoff_for_server_errors() {
+        let err = media_cache::MediaRangeError::HttpStatus {
+            range: "bytes=0-0".to_string(),
+            status: reqwest::StatusCode::BAD_GATEWAY,
+        };
+
+        assert_eq!(
+            media_range_retry_delay(&err, 0),
+            Some(Duration::from_millis(STREAM_TRANSIENT_RETRY_BASE_MS))
+        );
+        assert_eq!(
+            media_range_retry_delay(&err, 1),
+            Some(Duration::from_millis(STREAM_TRANSIENT_RETRY_BASE_MS * 2))
+        );
+        assert_eq!(media_range_retry_delay(&err, 2), None);
     }
 
     #[test]
@@ -2645,39 +2900,105 @@ mod tests {
     #[test]
     fn shared_bytes_keeps_multiple_requested_offsets_in_order() {
         let bytes = SharedBytes::new();
-        bytes.set_total(Some(1_000));
+        let total = media_cache::STREAM_CHUNK_BYTES * 4;
+        bytes.set_total(Some(total));
 
-        bytes.request_offset(500);
+        bytes.request_offset(media_cache::STREAM_CHUNK_BYTES + 500);
         bytes.request_offset(20);
-        bytes.request_offset(500);
+        bytes.request_offset(media_cache::STREAM_CHUNK_BYTES + 900);
 
-        assert_eq!(bytes.take_requested_offset(1_000), Some(500));
-        assert_eq!(bytes.take_requested_offset(1_000), Some(20));
-        assert_eq!(bytes.take_requested_offset(1_000), None);
+        assert_eq!(
+            bytes.take_requested_offset(total),
+            Some(media_cache::STREAM_CHUNK_BYTES)
+        );
+        assert_eq!(bytes.take_requested_offset(total), Some(0));
+        assert_eq!(bytes.take_requested_offset(total), None);
 
         bytes.request_offset(40);
-        bytes.request_offset(80);
-        bytes.append(&[1, 2, 3, 4], media_cache::ByteRange::new(40, 43).unwrap());
-        assert_eq!(bytes.take_requested_offset(1_000), Some(80));
+        bytes.request_offset(media_cache::STREAM_CHUNK_BYTES * 2);
+        bytes.append(
+            &[1, 2, 3, 4],
+            media_cache::ByteRange::new(0, media_cache::STREAM_CHUNK_BYTES - 1).unwrap(),
+        );
+        assert_eq!(
+            bytes.take_requested_offset(total),
+            Some(media_cache::STREAM_CHUNK_BYTES * 2)
+        );
     }
 
     #[test]
     fn shared_bytes_prioritizes_seek_offset_over_stale_requests() {
         let bytes = SharedBytes::new();
-        bytes.set_total(Some(1_000));
+        let total = media_cache::STREAM_CHUNK_BYTES * 5;
+        bytes.set_total(Some(total));
 
-        bytes.request_offset(100);
-        bytes.request_offset(200);
-        bytes.prioritize_offset(800);
+        bytes.request_offset(media_cache::STREAM_CHUNK_BYTES + 100);
+        bytes.request_offset(media_cache::STREAM_CHUNK_BYTES * 2 + 200);
+        bytes.prioritize_offset(media_cache::STREAM_CHUNK_BYTES * 3 + 800);
 
-        assert_eq!(bytes.take_requested_offset(1_000), Some(800));
-        assert_eq!(bytes.take_requested_offset(1_000), Some(100));
-        assert_eq!(bytes.take_requested_offset(1_000), Some(200));
+        assert_eq!(
+            bytes.take_requested_offset(total),
+            Some(media_cache::STREAM_CHUNK_BYTES * 3)
+        );
+        assert_eq!(
+            bytes.take_requested_offset(total),
+            Some(media_cache::STREAM_CHUNK_BYTES)
+        );
+        assert_eq!(
+            bytes.take_requested_offset(total),
+            Some(media_cache::STREAM_CHUNK_BYTES * 2)
+        );
 
-        bytes.request_offset(900);
-        bytes.prioritize_offset(900);
-        assert_eq!(bytes.take_requested_offset(1_000), Some(900));
-        assert_eq!(bytes.take_requested_offset(1_000), None);
+        bytes.request_offset(media_cache::STREAM_CHUNK_BYTES * 4 + 900);
+        bytes.prioritize_offset(media_cache::STREAM_CHUNK_BYTES * 4 + 1_000);
+        assert_eq!(
+            bytes.take_requested_offset(total),
+            Some(media_cache::STREAM_CHUNK_BYTES * 4)
+        );
+        assert_eq!(bytes.take_requested_offset(total), None);
+    }
+
+    #[test]
+    fn shared_bytes_deduplicates_decoder_offsets_by_network_chunk() {
+        let bytes = SharedBytes::new();
+        let total = media_cache::STREAM_CHUNK_BYTES * 2;
+        bytes.set_total(Some(total));
+
+        bytes.request_offset(65_535);
+        bytes.request_offset(131_070);
+        bytes.request_offset(media_cache::STREAM_CHUNK_BYTES + 5);
+        bytes.request_offset(media_cache::STREAM_CHUNK_BYTES + 65_535);
+
+        assert_eq!(bytes.take_requested_offset(total), Some(0));
+        assert_eq!(
+            bytes.take_requested_offset(total),
+            Some(media_cache::STREAM_CHUNK_BYTES)
+        );
+        assert_eq!(bytes.take_requested_offset(total), None);
+    }
+
+    #[test]
+    fn shared_bytes_caps_pending_offsets_and_keeps_seek_priority() {
+        let bytes = SharedBytes::new();
+        let total = media_cache::STREAM_CHUNK_BYTES * 12;
+        bytes.set_total(Some(total));
+
+        for index in 0..(STREAM_MAX_PENDING_OFFSETS + 3) {
+            bytes.request_offset(media_cache::STREAM_CHUNK_BYTES * index as u64);
+        }
+        bytes.prioritize_offset(media_cache::STREAM_CHUNK_BYTES * 10);
+
+        assert_eq!(
+            bytes.take_requested_offset(total),
+            Some(media_cache::STREAM_CHUNK_BYTES * 10)
+        );
+        for index in 0..(STREAM_MAX_PENDING_OFFSETS - 1) {
+            assert_eq!(
+                bytes.take_requested_offset(total),
+                Some(media_cache::STREAM_CHUNK_BYTES * index as u64)
+            );
+        }
+        assert_eq!(bytes.take_requested_offset(total), None);
     }
 
     #[test]

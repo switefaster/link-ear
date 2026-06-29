@@ -4127,6 +4127,23 @@ async fn handle_audio_player_events(
                 );
                 let _ = ui.send(UiEvent::PlaybackCache(Some(view))).await;
             }
+            player::AudioPlayerEvent::DownloadStatus {
+                operation_id,
+                session_id,
+                track_id,
+                message,
+            } => {
+                if !stream_event_matches_current(
+                    buffer,
+                    music,
+                    operation_id.as_deref(),
+                    &session_id,
+                    &track_id,
+                ) {
+                    continue;
+                }
+                send_status(ui, message).await;
+            }
             player::AudioPlayerEvent::Failed {
                 operation_id,
                 session_id,

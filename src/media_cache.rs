@@ -1,12 +1,17 @@
 #![allow(dead_code)]
 
+use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::header::{ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, RANGE};
+use reqwest::{
+    StatusCode,
+    header::{ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, RANGE},
+};
 
 use crate::core::{PlaybackByteRange, PlaybackTrack};
 
@@ -14,7 +19,7 @@ pub(crate) const READY_WINDOW_MS: u64 = 12_000;
 pub(crate) const LOW_WATERMARK_MS: u64 = 5_000;
 pub(crate) const HIGH_WATERMARK_MS: u64 = 15_000;
 pub(crate) const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-pub(crate) const STREAM_CHUNK_BYTES: u64 = 512 * 1024;
+pub(crate) const STREAM_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 const BILIBILI_MEDIA_ACCEPT: &str = "*/*";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +46,30 @@ pub(crate) struct CachedRange {
     pub(crate) path: PathBuf,
     pub(crate) range: ByteRange,
     pub(crate) total_bytes: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) enum MediaRangeError {
+    Request {
+        range: String,
+        source: reqwest::Error,
+    },
+    HttpStatus {
+        range: String,
+        status: StatusCode,
+    },
+    UnsupportedRange {
+        range: String,
+    },
+    Read {
+        range: String,
+        source: reqwest::Error,
+    },
+    UnexpectedLength {
+        range: String,
+        actual: u64,
+        expected: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -77,6 +106,72 @@ impl From<PlaybackByteRange> for ByteRange {
         Self {
             start: range.start,
             end_inclusive: range.end_inclusive,
+        }
+    }
+}
+
+impl MediaRangeError {
+    pub(crate) fn status(&self) -> Option<StatusCode> {
+        match self {
+            Self::HttpStatus { status, .. } => Some(*status),
+            Self::Request { source, .. } | Self::Read { source, .. } => source.status(),
+            Self::UnsupportedRange { .. } | Self::UnexpectedLength { .. } => None,
+        }
+    }
+
+    pub(crate) fn range(&self) -> &str {
+        match self {
+            Self::Request { range, .. }
+            | Self::HttpStatus { range, .. }
+            | Self::UnsupportedRange { range }
+            | Self::Read { range, .. }
+            | Self::UnexpectedLength { range, .. } => range,
+        }
+    }
+}
+
+impl fmt::Display for MediaRangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request { range, source } => {
+                write!(formatter, "media range request {range} failed: {source}")
+            }
+            Self::HttpStatus { range, status } => {
+                write!(
+                    formatter,
+                    "media range request {range} failed with HTTP {status}"
+                )
+            }
+            Self::UnsupportedRange { range } => {
+                write!(
+                    formatter,
+                    "media range request {range} did not return byte-range support"
+                )
+            }
+            Self::Read { range, source } => {
+                write!(formatter, "failed to read media range {range}: {source}")
+            }
+            Self::UnexpectedLength {
+                range,
+                actual,
+                expected,
+            } => {
+                write!(
+                    formatter,
+                    "media range {range} returned {actual} bytes, expected {expected}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for MediaRangeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Request { source, .. } | Self::Read { source, .. } => Some(source),
+            Self::HttpStatus { .. }
+            | Self::UnsupportedRange { .. }
+            | Self::UnexpectedLength { .. } => None,
         }
     }
 }
@@ -246,32 +341,9 @@ pub(crate) async fn fetch_range(
         });
     }
 
-    let response = client
-        .get(&track.audio_url)
-        .header(RANGE, range.header_value())
-        .header("referer", track.referer.as_str())
-        .send()
+    let (bytes, probe) = fetch_range_bytes(client, track, range)
         .await
-        .with_context(|| format!("failed to fetch media range {}", range.header_value()))?
-        .error_for_status()
-        .context("media range request failed")?;
-
-    let probe = parse_range_probe(response.headers());
-    if !probe.supports_ranges {
-        bail!("media server does not support HTTP range requests");
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .context("failed to read media range")?;
-    if bytes.len() as u64 != range.len() {
-        bail!(
-            "media range returned {} bytes, expected {}",
-            bytes.len(),
-            range.len()
-        );
-    }
+        .map_err(anyhow::Error::from)?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -289,20 +361,26 @@ pub(crate) async fn fetch_range(
 pub(crate) async fn probe_range_support(
     client: &reqwest::Client,
     track: &PlaybackTrack,
-) -> Result<RangeProbe> {
-    let response = client
-        .get(&track.audio_url)
-        .header(ACCEPT, BILIBILI_MEDIA_ACCEPT)
-        .header(RANGE, "bytes=0-0")
-        .header("referer", track.referer.as_str())
+) -> std::result::Result<RangeProbe, MediaRangeError> {
+    let range = "bytes=0-0".to_string();
+    let response = media_range_request(client, track, &range)
         .send()
         .await
-        .context("failed to probe media range support")?
-        .error_for_status()
-        .context("media range probe failed")?;
+        .map_err(|source| MediaRangeError::Request {
+            range: range.clone(),
+            source,
+        })?;
+    if !response.status().is_success() {
+        return Err(MediaRangeError::HttpStatus {
+            range,
+            status: response.status(),
+        });
+    }
 
     let probe = parse_range_probe(response.headers());
-    range_probe_error(&probe)?;
+    if !probe.supports_ranges {
+        return Err(MediaRangeError::UnsupportedRange { range });
+    }
     Ok(probe)
 }
 
@@ -310,33 +388,56 @@ pub(crate) async fn fetch_range_bytes(
     client: &reqwest::Client,
     track: &PlaybackTrack,
     range: ByteRange,
-) -> Result<(Vec<u8>, RangeProbe)> {
-    let response = client
-        .get(&track.audio_url)
-        .header(ACCEPT, BILIBILI_MEDIA_ACCEPT)
-        .header(RANGE, range.header_value())
-        .header("referer", track.referer.as_str())
+) -> std::result::Result<(Vec<u8>, RangeProbe), MediaRangeError> {
+    let range_header = range.header_value();
+    let response = media_range_request(client, track, &range_header)
         .send()
         .await
-        .with_context(|| format!("failed to fetch media range {}", range.header_value()))?
-        .error_for_status()
-        .context("media range request failed")?;
+        .map_err(|source| MediaRangeError::Request {
+            range: range_header.clone(),
+            source,
+        })?;
+    if !response.status().is_success() {
+        return Err(MediaRangeError::HttpStatus {
+            range: range_header,
+            status: response.status(),
+        });
+    }
 
     let probe = parse_range_probe(response.headers());
-    range_probe_error(&probe)?;
+    if !probe.supports_ranges {
+        return Err(MediaRangeError::UnsupportedRange {
+            range: range_header,
+        });
+    }
     let bytes = response
         .bytes()
         .await
-        .context("failed to read media range")?;
+        .map_err(|source| MediaRangeError::Read {
+            range: range_header.clone(),
+            source,
+        })?;
     if bytes.len() as u64 != range.len() {
-        bail!(
-            "media range returned {} bytes, expected {}",
-            bytes.len(),
-            range.len()
-        );
+        return Err(MediaRangeError::UnexpectedLength {
+            range: range_header,
+            actual: bytes.len() as u64,
+            expected: range.len(),
+        });
     }
 
     Ok((bytes.to_vec(), probe))
+}
+
+fn media_range_request<'a>(
+    client: &'a reqwest::Client,
+    track: &'a PlaybackTrack,
+    range: &'a str,
+) -> reqwest::RequestBuilder {
+    client
+        .get(&track.audio_url)
+        .header(ACCEPT, BILIBILI_MEDIA_ACCEPT)
+        .header(RANGE, range)
+        .header("referer", track.referer.as_str())
 }
 
 pub(crate) fn evict_cache(root: &Path, max_bytes: u64) -> Result<u64> {
